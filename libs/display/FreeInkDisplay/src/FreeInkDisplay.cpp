@@ -7,7 +7,7 @@
 #include <fstream>
 #include <vector>
 #endif
-#if FREEINK_FB_PSRAM
+#if FREEINK_FB_PSRAM || defined(FREEINK_FB_INTERNAL)
 #include <cstdlib>
 
 #include "esp_heap_caps.h"
@@ -380,6 +380,17 @@ uint8_t* FreeInkDisplay::allocFrameBufferStorage() const {
 #if FREEINK_FB_PSRAM
   uint8_t* buf = static_cast<uint8_t*>(heap_caps_malloc(bufferSize, MALLOC_CAP_SPIRAM));
   if (buf) return buf;
+#elif defined(FREEINK_FB_INTERNAL)
+  // Pin the framebuffer to internal SRAM. Under CONFIG_SPIRAM_USE_MALLOC (the
+  // prebuilt S3 qio_opi core default, ALWAYSINTERNAL=4096) a plain malloc of a
+  // >4 KB framebuffer prefers octal PSRAM, which is 4-9x slower than internal
+  // SRAM — and this buffer is the hottest read-modify-write target in the
+  // firmware (per-pixel drawPixel passes, plane pushes). Opt-in via
+  // -DFREEINK_FB_INTERNAL on PSRAM boards whose framebuffer fits internal RAM
+  // comfortably (e.g. X4 Pro: 48 KB against ~300+ KB free internal). Falls back
+  // to the default policy if internal allocation fails.
+  uint8_t* buf = static_cast<uint8_t*>(heap_caps_malloc(bufferSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  if (buf) return buf;
 #endif
   return static_cast<uint8_t*>(malloc(bufferSize));
 }
@@ -642,7 +653,15 @@ void FreeInkDisplay::displayAsyncImpl(RefreshMode mode, bool turnOffScreen, bool
     return;
   }
   if (_asyncShadow == nullptr) {
+#if defined(FREEINK_FB_INTERNAL) && !FREEINK_FB_PSRAM
+    // Same rationale as allocFrameBufferStorage: under SPIRAM_USE_MALLOC this
+    // 48 KB shadow would land in PSRAM and slow the per-refresh memcpy + the
+    // driver's prev-frame reads. Internal-first, plain malloc fallback.
+    _asyncShadow = static_cast<uint8_t*>(heap_caps_malloc(bufferSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (_asyncShadow == nullptr) _asyncShadow = static_cast<uint8_t*>(malloc(bufferSize));
+#else
     _asyncShadow = static_cast<uint8_t*>(malloc(bufferSize));
+#endif
     _shadowValid = false;
   }
   if (_asyncShadow == nullptr) {  // allocation failed: blocking fallback
