@@ -440,6 +440,11 @@ struct SdmmcPins {
   int8_t d2;
   int8_t d3;
   uint8_t busWidth;  // 0 = not an SDMMC board (use SdPins/SPI), 1 or 4 = SDMMC
+  // Bus clock ceiling in kHz. 0 (default) = esp-idf SDMMC_FREQ_DEFAULT. NOTE:
+  // SDMMC_FREQ_DEFAULT is 20 MHz (20000 kHz) — not the 40 MHz the SDMMC mount
+  // code long claimed; 40 MHz is SDMMC_FREQ_HIGHSPEED (40000). Defaulted so
+  // every existing profile initializer keeps today's exact behavior.
+  uint32_t maxFreqKhz = 0;
 };
 
 // The I2C fuel-gauge silicon a board carries. Each type has its own register map and
@@ -1382,6 +1387,21 @@ constexpr BoardProfile STICKY = {
 //     the GPIO5 SD-enable role and GPIO2 (a board-init output driven LOW, role unknown), and
 //     battery/VBUS pins. The ADC-ladder pins are UNKNOWN — GPIO1/GPIO2 (the old guess) are power
 //     outputs, not ladder inputs. See the findings doc before trusting any PENDING value.
+// X4 Pro SDMMC clock. The mount historically set esp-idf's SDMMC_FREQ_DEFAULT
+// believing it was 40 MHz; SDMMC_FREQ_DEFAULT is actually 20000 kHz (20 MHz), so
+// every unit in the field has been running 20 MHz — that stays the default here.
+// Define -DFREEINK_X4PRO_SDMMC_HS to request SDMMC_FREQ_HIGHSPEED (40 MHz; esp-idf
+// issues the CMD6 high-speed switch when the card supports it): ~2x sequential
+// throughput in 1-bit mode (~2.2 -> ~4.5 MB/s), in-spec for the bus but
+// signal-margin dependent through this wiring. Opt-in only; validate mounts and
+// sustained reads on your hardware across panel/socket batches.
+#ifndef FREEINK_X4PRO_SDMMC_KHZ
+#ifdef FREEINK_X4PRO_SDMMC_HS
+#define FREEINK_X4PRO_SDMMC_KHZ 40000u
+#else
+#define FREEINK_X4PRO_SDMMC_KHZ 20000u
+#endif
+#endif
 constexpr BoardProfile XTEINK_X4_PRO = {
     Board::XteinkX4Pro,
     "xteink_x4_pro",
@@ -1465,11 +1485,13 @@ constexpr BoardProfile XTEINK_X4_PRO = {
     NO_LEDS,
     NO_FLIP,  // panel mount transform pending hardware; native SSD1677 scan is 800x480 landscape
     // SD is native SDMMC, NOT SPI: the card the OEM reads is silent to SPI-mode CMD0.
-    // CONFIRMED on hardware: 1-bit, slot 1, CLK=41 CMD=42 DAT0=40, internal pull-ups, 40 MHz.
+    // CONFIRMED on hardware: 1-bit, slot 1, CLK=41 CMD=42 DAT0=40, internal pull-ups.
+    // Clock: 20 MHz by default (the field-proven value — see FREEINK_X4PRO_SDMMC_HS
+    // above for the 40 MHz opt-in and the history of the "40 MHz" mislabel).
     // D1/D2/D3 are UNUSED in 1-bit. Mounts reliably via SdmmcBlockDevice, which power-cycles
     // the GPIO5 enable (see the SPI SdPins powerEnable above) and validates a real sector-0
-    // read per attempt. {clk,cmd,d0,d1,d2,d3,busWidth}
-    {41, 42, 40, PIN_UNASSIGNED, PIN_UNASSIGNED, PIN_UNASSIGNED, 1},
+    // read per attempt. {clk,cmd,d0,d1,d2,d3,busWidth,maxFreqKhz}
+    {41, 42, 40, PIN_UNASSIGNED, PIN_UNASSIGNED, PIN_UNASSIGNED, 1, FREEINK_X4PRO_SDMMC_KHZ},
     // CW2017 fuel gauge at I2C 0x63 on the SHARED touch/RTC bus SDA39/SCL38, 400 kHz, Wire.
     // BatteryMonitor uploads the 80-byte BATINFO battery profile (recovered from app1's
     // XTEink Cw2017PowerHal via Ghidra) if the gauge hasn't got one, then reads SoC from
