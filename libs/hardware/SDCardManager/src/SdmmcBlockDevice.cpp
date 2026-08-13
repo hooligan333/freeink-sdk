@@ -18,11 +18,15 @@ bool SdmmcBlockDevice::begin(const BoardConfig::SdmmcPins& pins) {
   if (pins.busWidth == 0) return false;
 
   // Host config matches the OEM (recovered from app1's mountSD via Ghidra): full
-  // default capability flags (0x37) with the actual width selected via slot.width
-  // only, and the data clock at 40 MHz. The read timeouts we chased earlier were a
+  // default capability flags (0x37) with the actual width selected via slot.width.
+  // Clock comes from the board profile (SdmmcPins.maxFreqKhz; 0 = esp-idf default).
+  // NOTE: SDMMC_FREQ_DEFAULT is 20 MHz (20000 kHz), not the 40 MHz this code long
+  // claimed — 40 MHz is SDMMC_FREQ_HIGHSPEED, which a board opts into via its
+  // profile (esp-idf issues the CMD6 high-speed switch when max_freq_khz > 20 MHz
+  // and the card supports it). The read timeouts we chased earlier were a
   // mount-sequencing problem, not a clock-margin one — see the retry loop below.
   sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-  host.max_freq_khz = SDMMC_FREQ_DEFAULT;  // 40 MHz
+  host.max_freq_khz = pins.maxFreqKhz != 0 ? static_cast<int>(pins.maxFreqKhz) : SDMMC_FREQ_DEFAULT;
 
   // Slot pin map. The ESP32-S3 routes SDMMC through the GPIO matrix, so the data
   // and clock/command lines are assignable (unlike the classic ESP32's fixed slot).
@@ -108,6 +112,13 @@ bool SdmmcBlockDevice::begin(const BoardConfig::SdmmcPins& pins) {
     return false;
   }
   _card = card;
+  if (Serial) {
+    // The one line that answers "what clock is the card actually running at":
+    // requested is the profile's ceiling; real is what the host controller
+    // negotiated (CMD6 high-speed switch included). Mirrors the failure printf.
+    Serial.printf("[%lu] [SD] SDMMC mounted: %u-bit, requested %d kHz, running %d kHz\n", millis(),
+                  static_cast<unsigned>(pins.busWidth), host.max_freq_khz, card->real_freq_khz);
+  }
   return true;
 }
 
