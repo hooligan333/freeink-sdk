@@ -53,6 +53,17 @@ struct Ssd1677Config {
   // collapsing toward B/W). The X4 keeps the panel powered between fast
   // refreshes, so it never needs this and keeps stock behavior.
   bool grayPowerUpFirst = false;
+  // Leave the panel physically powered down at page dwell. A stock fast sequence
+  // with no power-off bits (X4/X4 Pro 0xFC) latches clock/analog/booster ON for as
+  // long as the page is up (~1-3 mA) instead of the panel's ~25-40 uA quiescent.
+  // This appends ANALOG_OFF|CLOCK_OFF to the activations the DRIVER assembles: the
+  // incremental fast/DU path (0x1C -> 0xDF) and the custom-LUT grayscale activation
+  // (0xCC -> 0xCF, where the driver already mirrors power-off in software). Vendor
+  // sequences carry the bits in the sequence byte instead (Sticky's 0xFF), and
+  // FULL/HALF (0xF7/0xD7) already end with them, so neither is touched here. The
+  // cost is the booster ramp at the start of the next refresh (~20-40 ms), so a
+  // board setting this also wants grayPowerUpFirst.
+  bool fastSelfPowerOff = false;
 };
 
 // Standard config (Xteink X4 / GDEQ0426T82). Panel mounting (mirror/180°) is NOT

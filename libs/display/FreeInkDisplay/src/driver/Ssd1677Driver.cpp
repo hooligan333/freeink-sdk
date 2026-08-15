@@ -118,6 +118,45 @@ static Ssd1677Config fastDuRefreshShortcut(Ssd1677Config base) {
   return base;
 }
 
+// Rail power-off shortcut (~20-40 ms/refresh). Makes every refresh self-power-cycle so
+// the panel dwells at its ~25-40 uA quiescent while a page is being read instead of
+// holding clock/analog/booster latched (~1-3 mA continuous — the largest steady term
+// once the CPU idles). The stock X4/X4 Pro fast sequence 0xFC carries no power-off bits;
+// Seeed's Sticky ships exactly this pattern in production (fast 0xFF), so the trade —
+// paying the booster ramp at the start of the next refresh — is validated silicon
+// behavior, not a guess. Opt-in per board because that ramp is per-refresh latency.
+//
+// Composes with fastDuRefreshShortcut in either direction. With a vendor fast sequence
+// still selected the bits ride in the sequence byte (0xFC -> 0xFF: bits 1:0 only, so the
+// same partial/DU waveform and the same border values); with the incremental DU path
+// selected (fastSeqOverride == 0) fastSelfPowerOff appends them to the activation the
+// driver assembles. FULL/HALF stay untouched — 0xF7/0xD7 already carry 0x03 — and nothing
+// here goes through powerOffController(), whose fixed 200 ms settle belongs to turnOff
+// and deepSleep, never to a per-refresh path. An AA/grayscale page pays the ramp TWICE
+// (the BW stage closes powered-down, the pre-gray settle ramps again, and 0xCF closes
+// powered-down once more), so budget ~2 ramps per AA page, not one.
+//
+// Dwell-path audit for the powered-down page: controller RAM writes need no analog rails,
+// so the post-refresh baseline resync, seedPreviousFrame() and cleanupGrayscaleBuffers()
+// stay valid with the panel off (Sticky runs that way in production); the power-off bits
+// execute inside the waveform, so the async path never arms _pendingPowerOff; and
+// displayImpl()'s cold-start promotion keys off fullSeqOverride, which this leaves set,
+// so pages are not promoted to HALF just because _isScreenOn is now false every time.
+// Guarded by the one flag that references it so the flag-off and DU-only builds stay
+// free of a new unused-function warning; a future board adopting the shortcut widens
+// the guard with its own flag.
+#ifdef FREEINK_X4PRO_RAIL_POWEROFF_SHORTCUT
+static Ssd1677Config railPowerOffShortcut(Ssd1677Config base) {
+  if (base.fastSeqOverride != 0) base.fastSeqOverride |= 0x03;  // ANALOG_OFF|CLOCK_OFF end-of-sequence
+  base.fastSelfPowerOff = true;  // incremental 0x1C DU path + the 0xCC custom-LUT activation
+  // The rails may now be down entering a grayscale refresh, so settle them first: the gray
+  // LUT's 1-frame phases would otherwise run on a still-ramping booster and under-drive the
+  // grays (lighter AA, mid-grays collapsing) — the reason Sticky sets it. See Ssd1677Config.
+  base.grayPowerUpFirst = true;
+  return base;
+}
+#endif
+
 // Xteink X4 with the fast-DU shortcut — OPT-IN via -DFREEINK_X4_FAST_DU_SHORTCUT.
 // The X4 default stays the stock 0xFC absolute partial sequence: the 0x1C path
 // skips the per-refresh temperature load and power sequencing, which is the
@@ -134,17 +173,38 @@ static const Ssd1677Config& ssd1677X4Config() {
 }
 #endif
 
-// Xteink X4 Pro with the fast-DU shortcut — OPT-IN via
-// -DFREEINK_X4PRO_FAST_DU_SHORTCUT. The X4 Pro paints on the stock X4 config
-// (same GDEQ0426T82 panel class — see ssd1677ActiveConfig), so the same
-// ~85 ms/refresh win applies, and so does the same panel-variance caveat: 0x1C
-// skips the per-refresh temperature load and power sequencing, and artifacts
-// tend to appear only over long sessions and across temperature. Enable only
-// after validating on your unit. SSD1677-batch units only — UC8179/UC8279
-// batches select a different driver and never reach this config.
+// Xteink X4 Pro shortcut stack. Each layer is separately OPT-IN; with no flag defined the
+// X4 Pro keeps the stock X4 config unchanged (see ssd1677ActiveConfig). SSD1677-batch
+// units only — UC8179/UC8279 batches select a different driver and never reach this
+// config.
+//
+// -DFREEINK_X4PRO_FAST_DU_SHORTCUT: the X4 Pro paints on the stock X4 config (same
+// GDEQ0426T82 panel class), so the same ~85 ms/refresh win applies, and so does the same
+// panel-variance caveat: 0x1C skips the per-refresh temperature load and power
+// sequencing, and artifacts tend to appear only over long sessions and across
+// temperature.
+//
+// -DFREEINK_X4PRO_RAIL_POWEROFF_SHORTCUT: self-power-cycle every refresh so the page
+// dwell costs ~25-40 uA instead of ~1-3 mA, at ~20-40 ms more per refresh. Its risk is
+// visual rather than thermal — every waveform now starts on a cold booster — so validate
+// AA/grayscale pages and long reading sessions before shipping it.
+//
+// The layers are applied fast-DU first: it decides whether a vendor fast sequence is
+// still in play, and railPowerOffShortcut covers both cases.
+#if defined(FREEINK_X4PRO_FAST_DU_SHORTCUT) || defined(FREEINK_X4PRO_RAIL_POWEROFF_SHORTCUT)
+static Ssd1677Config ssd1677X4ProShortcutStack() {
+  Ssd1677Config cfg = ssd1677DefaultConfig();
 #ifdef FREEINK_X4PRO_FAST_DU_SHORTCUT
+  cfg = fastDuRefreshShortcut(cfg);
+#endif
+#ifdef FREEINK_X4PRO_RAIL_POWEROFF_SHORTCUT
+  cfg = railPowerOffShortcut(cfg);
+#endif
+  return cfg;
+}
+
 static const Ssd1677Config& ssd1677X4ProConfig() {
-  static const Ssd1677Config cfg = fastDuRefreshShortcut(ssd1677DefaultConfig());
+  static const Ssd1677Config cfg = ssd1677X4ProShortcutStack();
   return cfg;
 }
 #endif
@@ -216,7 +276,10 @@ void Ssd1677Driver::initController(EpdBus& bus) {
   // Override boards can't use _isScreenOn to detect a cold start (their fast
   // sequence powers down after every page), so arm an explicit one-shot full
   // refresh for the first paint — it clears the boot screen and seeds the baseline.
-  _needsInitialFull = (_cfg.fullSeqOverride != 0);
+  // fastSelfPowerOff boards are in the same state regardless of their sequence
+  // bytes, so they arm it too (moot where fullSeqOverride is also set, load-bearing
+  // for a hypothetical incremental-only base).
+  _needsInitialFull = (_cfg.fullSeqOverride != 0 || _cfg.fastSelfPowerOff);
 }
 
 void Ssd1677Driver::setRamArea(EpdBus& bus, uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
@@ -343,10 +406,23 @@ void Ssd1677Driver::refresh(EpdBus& bus, RefreshMode mode, bool turnOff, bool as
     // not, so 0xCC is correct in both states. The production driver marks power OFF
     // after this pass; mirror that so the next refresh re-enables the rails.
     displayMode = 0xCC;
-    if (turnOff) displayMode |= 0x03;
+    // fastSelfPowerOff makes that software mirror physically true: appending
+    // ANALOG_OFF|CLOCK_OFF (-> 0xCF) leaves an AA page dwelling at panel quiescent like
+    // every other refresh, instead of holding the rails up until the next update.
+    if (turnOff || _cfg.fastSelfPowerOff) displayMode |= 0x03;
     _isScreenOn = false;
   } else {  // Fast
     displayMode |= 0x1C;
+    if (_cfg.fastSelfPowerOff) {
+      // Close the DU waveform with ANALOG_OFF|CLOCK_OFF so the page dwell costs panel
+      // quiescent (~25-40 uA) instead of latched clock/analog/booster: 0xC0|0x1C|0x03 =
+      // 0xDF. Entering from a powered-down panel is not a new state — the 0xC0 fold above
+      // already runs on the first fast after every FULL/HALF (both self-power-off). Doing
+      // it inside the waveform is what keeps powerOffController()'s fixed 200 ms settle
+      // off the refresh path, and leaves _pendingPowerOff clear for the async path.
+      displayMode |= 0x03;
+      _isScreenOn = false;
+    }
   }
 
   bus.cmd(CMD_DISPLAY_UPDATE_CTRL2);
@@ -364,7 +440,11 @@ void Ssd1677Driver::powerOn(EpdBus& bus) {
   bus.cmd(CMD_DISPLAY_UPDATE_CTRL2);
   bus.data(0xC0);  // CLOCK_ON | ANALOG_ON
   bus.cmd(CMD_MASTER_ACTIVATION);
-  bus.waitBusy("gray power-on");
+  // waitRefreshComplete, not waitBusy: active-high BUSY can trail MASTER_ACTIVATION
+  // by a few microseconds, and the bare poll would fall through before the power-up
+  // sequence even starts — the next activation would then be issued mid-ramp, which
+  // is exactly the under-driven-grays state this settle exists to prevent.
+  bus.waitRefreshComplete("gray power-on");
   _isScreenOn = true;
 }
 
@@ -426,10 +506,13 @@ void Ssd1677Driver::displayImpl(EpdBus& bus, const uint8_t* fb, const uint8_t* p
       if (mode == RefreshMode::Fast) mode = RefreshMode::Full;
       _needsInitialFull = false;
       mode = (_cfg.halfSeqOverride != 0) ? RefreshMode::Half : RefreshMode::Full;
-    } else if (!_isScreenOn && _cfg.fullSeqOverride == 0) {
+    } else if (!_isScreenOn && _cfg.fullSeqOverride == 0 && !_cfg.fastSelfPowerOff) {
       // X4-class cold start: panel asleep -> a (warmed) HALF full-clear. Override
       // boards skip this — their fast sequence self-powers, so _isScreenOn is false
       // every page and forcing HALF would make every page a slow full-waveform flash.
+      // fastSelfPowerOff puts a board in that same state without changing its sequences,
+      // so it is excluded here explicitly (not just via fullSeqOverride staying set on
+      // the X4 Pro stack): _needsInitialFull covers its cold start instead.
       mode = RefreshMode::Half;
     }
   }
@@ -467,7 +550,8 @@ void Ssd1677Driver::displayImpl(EpdBus& bus, const uint8_t* fb, const uint8_t* p
   // single-buffer mode so the next differential update starts from a matched
   // BW/RED baseline instead of assuming BW survived the refresh unchanged.
   // (Async updates always come with a facade-owned prev, so this never runs
-  // while a refresh is still in flight.)
+  // while a refresh is still in flight.) Writing RAM needs neither clock nor analog, so
+  // this is equally valid after a self-powering sequence left the panel off.
   if (prev == nullptr && !async) {
     setRamArea(bus, 0, 0, _w, _h);
     writeRam(bus, CMD_WRITE_RAM_BW, fb, _bufferSize);
@@ -648,7 +732,10 @@ void Ssd1677Driver::setCustomLut(EpdBus& bus, bool enabled, const unsigned char*
 void Ssd1677Driver::deepSleep(EpdBus& bus) {
   // Stock parity (_powerOff): park the border at its init value so it is not left
   // driven with the full-refresh waveform through deep sleep, then power down
-  // analog/clock. Stock does not touch CTRL1 here.
+  // analog/clock. Stock does not touch CTRL1 here. On a self-powering board the rails
+  // are already down and this no-ops (powerOffController's guard) — leaving the border
+  // register unparked is harmless there because nothing drives it without the analog
+  // rail, and 0x10 follows immediately. Sticky has shipped that way.
   powerOffController(bus);
   // Stock parity: deep sleep mode 2 (0x03) discards controller RAM. Nothing may
   // treat RAM as a valid diff baseline after wake — initController() re-arms
@@ -674,8 +761,9 @@ static const Ssd1677Config& ssd1677ActiveConfig() {
     case BoardConfig::Board::Sticky: return ssd1677StickyConfig();
     // X4 Pro runs on the stock X4/GDEQ0426T82 config — same controller and panel
     // class, confirmed painting on hardware. No custom LUT or drive voltages needed.
-    // Layers the fast-DU shortcut only when the build opts in (ssd1677X4ProConfig).
-#ifdef FREEINK_X4PRO_FAST_DU_SHORTCUT
+    // Layers the opt-in shortcuts (fast-DU, rail power-off) only when the build asks
+    // for them; with no flag it is the stock config itself (ssd1677X4ProConfig).
+#if defined(FREEINK_X4PRO_FAST_DU_SHORTCUT) || defined(FREEINK_X4PRO_RAIL_POWEROFF_SHORTCUT)
     case BoardConfig::Board::XteinkX4Pro: return ssd1677X4ProConfig();
 #else
     case BoardConfig::Board::XteinkX4Pro: return ssd1677DefaultConfig();
