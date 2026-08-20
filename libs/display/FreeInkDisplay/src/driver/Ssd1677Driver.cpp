@@ -662,6 +662,10 @@ void Ssd1677Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, co
   setCustomLut(bus, true, selectedLut);
 
   if (factoryMode) {
+    // Settled rails first where the config asks for it (rail-poweroff boards
+    // enter every grayscale refresh with the booster down; 0xC7's folded
+    // CLOCK_ON|ANALOG_ON is not a substitute for the settle, same as 0xCC).
+    if (_cfg.grayPowerUpFirst) powerOn(bus);
     // Explicit, self-contained power cycle for 4-level absolute grayscale.
     // Reset CTRL1 to normal — a prior HALF leaves BYPASS_RED set, which would
     // ignore RED RAM and break 4-level grayscale.
@@ -670,7 +674,11 @@ void Ssd1677Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, co
     bus.cmd(CMD_DISPLAY_UPDATE_CTRL2);
     bus.data(0xC7);  // CLOCK_ON|ANALOG_ON|DISPLAY_START|ANALOG_OFF|CLOCK_OFF
     bus.cmd(CMD_MASTER_ACTIVATION);
-    bus.waitBusy("factory_gray");
+    // waitRefreshComplete, not waitBusy: active-high BUSY can trail
+    // MASTER_ACTIVATION; a bare poll can fall through mid-waveform, after
+    // which the caller's cleanup rewrites RED RAM while the panel is still
+    // driving it (same hazard documented at powerOn and in EpdBus).
+    bus.waitRefreshComplete("factory_gray");
     _isScreenOn = false;  // 0xC7 always powers down after the update
   } else {
     // Settled rails before the gray waveform (no-op where the panel is already
