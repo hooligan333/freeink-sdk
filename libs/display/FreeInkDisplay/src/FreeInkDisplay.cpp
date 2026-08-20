@@ -386,6 +386,10 @@ uint8_t* FreeInkDisplay::allocFrameBufferStorage() const {
   // to the default policy if internal allocation fails.
   uint8_t* buf = static_cast<uint8_t*>(heap_caps_malloc(bufferSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
   if (buf) return buf;
+  // The whole point of the flag is internal placement; if the fallback below has
+  // to serve this from PSRAM instead, say so — silently forfeiting the pin would
+  // make every "why is rendering slow" investigation start from a false premise.
+  Serial.printf("[EPD] FB internal alloc failed (%u B); falling back to default heap\n", (unsigned)bufferSize);
 #endif
   return static_cast<uint8_t*>(malloc(bufferSize));
 }
