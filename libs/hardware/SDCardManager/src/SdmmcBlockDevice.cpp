@@ -104,6 +104,24 @@ bool SdmmcBlockDevice::begin(const BoardConfig::SdmmcPins& pins) {
     mountErr = e;
     if (e == ESP_OK) break;
   }
+  // Clock backoff: a card/socket that cannot hold an elevated clock through this
+  // wiring fails all four attempts identically — better a slow mount than no SD.
+  // One extra attempt at the stock default clock, same power-cycle discipline.
+  if (mountErr != ESP_OK && host.max_freq_khz != SDMMC_FREQ_DEFAULT) {
+    if (Serial) Serial.printf("[SDMMC] %d kHz mount failed; retrying at default clock\n", host.max_freq_khz);
+    host.max_freq_khz = SDMMC_FREQ_DEFAULT;
+    if (sdPwr >= 0) {
+      digitalWrite(sdPwr, HIGH);
+      delay(80);
+      digitalWrite(sdPwr, LOW);
+      delay(120);
+    }
+    esp_err_t e = sdmmc_card_init(&host, card);
+    if (e == ESP_OK || card->csd.capacity != 0) {
+      e = sdmmc_read_sectors(card, _dmaBuffer, 0, 1);
+    }
+    mountErr = e;
+  }
   if (mountErr != ESP_OK) {
     if (Serial)
       Serial.printf("[%lu] [SD] SDMMC mount failed after retries: %s\n", millis(), esp_err_to_name(mountErr));
