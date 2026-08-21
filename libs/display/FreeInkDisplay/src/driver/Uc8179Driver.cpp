@@ -159,6 +159,7 @@ void Uc8179Driver::initController(EpdBus& bus) {
 #endif
 #ifdef FREEINK_UC8179_LEAN_STREAMS
   _dtm1Stale = false;
+  _aaUploadFollows = false;
 #endif
 #ifdef FREEINK_UC8179_DOUBLE_GRAY_PRE
   _deepEqualizeNext = false;
@@ -192,6 +193,12 @@ void Uc8179Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, 
 }
 
 void Uc8179Driver::transitionGrayscaleBase(EpdBus& bus, const uint8_t* fb, bool turnOff) {
+#ifdef FREEINK_UC8179_LEAN_STREAMS
+  // Consumed unconditionally at entry — before every early return — so it can
+  // never carry into a later transition. See the member's declaration.
+  const bool aaUploadFollows = _aaUploadFollows;
+  _aaUploadFollows = false;
+#endif
   if (!fb) return;
 #ifdef FREEINK_UC8179_RAIL_POWEROFF
   settlePrewarm(bus);
@@ -225,10 +232,23 @@ void Uc8179Driver::transitionGrayscaleBase(EpdBus& bus, const uint8_t* fb, bool 
   // stream (~26-30 ms at 20 MHz) dead work on every anti-aliased page. Owe it
   // instead: _grayBase holds the frame, and the handful of consumers that read
   // DTM1 as the OLD plane flush the debt before they need it.
-  if (_grayBaseValid) {
+  //
+  // Only when that AA upload is genuinely coming, i.e. only on the
+  // displayGrayscaleBase() path, where copyGrayscaleLsb() discharges the debt a
+  // few milliseconds later inside this same render. The other caller is
+  // display()'s post-AA Fast reroute — the Home/menu/activity transition — after
+  // which NOTHING follows: the render ends, the host goes idle, the rails park,
+  // and the debt sits across that whole gap with DTM1 still holding the page
+  // before last. Anything that then went wrong with the activation would be
+  // laundered into the differential baseline by displayFinish()'s DTM1 stream on
+  // the next ordinary page, which would skip pixels the panel never displayed.
+  // Streaming eagerly here (as the pre-lean code always did) costs ~26-30 ms on
+  // transitions only and leaves no controller-RAM debt outstanding across an
+  // idle gap anywhere in the driver.
+  if (_grayBaseValid && aaUploadFollows) {
     _dtm1Stale = true;
   } else {
-    streamPlane(bus, CMD_DTM1, fb);  // no snapshot to restore from later
+    streamPlane(bus, CMD_DTM1, fb);  // no AA upload coming, or no snapshot to restore from
   }
 #else
   streamPlane(bus, CMD_DTM1, fb);
@@ -306,6 +326,11 @@ void Uc8179Driver::displayGrayscaleBase(EpdBus& bus, const uint8_t* fb, RefreshM
     return;
   }
 
+#ifdef FREEINK_UC8179_LEAN_STREAMS
+  // This is the one caller after which an AA plane upload really does follow,
+  // so it is the one caller allowed to defer the OLD-plane restore.
+  _aaUploadFollows = true;
+#endif
   transitionGrayscaleBase(bus, fb, turnOff);
 }
 
@@ -803,10 +828,29 @@ void Uc8179Driver::flushPendingOldPlane(EpdBus& bus) {
 #endif
 
 #ifdef FREEINK_UC8179_RAIL_POWEROFF
+// Ride out the prewarm PON and only then call the rails up. The rail state this
+// leaves behind is an OBSERVATION, never a hope: beginDisplayWork() fires the
+// command and returns, so nothing before this point knows whether the
+// controller took it.
 void Uc8179Driver::settlePrewarm(EpdBus& bus) {
   if (!_ponPending) return;
   _ponPending = false;
-  bus.waitBusy(" 8179_prewarm_PON");
+  // waitBusy()'s UcIdleHigh assertion grace waits out a BUSY_N that trails the
+  // command, so a real ramp is now ridden to completion here instead of being
+  // stepped over by a single tickless-shortened delay(1).
+  if (!bus.waitBusy(" 8179_prewarm_PON") && !_isScreenOn) {
+    // BUSY_N never asserted inside that window, yet the rails were down when
+    // the prewarm fired and PON is a measured 127 ms ramp — so the controller
+    // cannot merely have finished early. Either it was still busy when the
+    // opcode arrived and discarded it (the UC family drops commands issued
+    // while BUSY_N is low), or the opcode never landed. Re-issue and wait for
+    // real. PON is idempotent: it is the same command deepSleep() and every
+    // display path issue against an unknown rail state, and a PON on already-up
+    // rails is a no-op the controller answers immediately.
+    bus.cmd(CMD_POWER_ON);
+    bus.waitBusy(" 8179_prewarm_PON_retry");
+  }
+  _isScreenOn = true;
 }
 
 // Park the analog rails once the host's controller-work queue has drained. POF
@@ -824,19 +868,26 @@ void Uc8179Driver::controllerIdle(EpdBus& bus) {
   _isScreenOn = false;
 }
 
-// Rail prewarm from the host's input dispatch, before the page is composed.
+// Rail prewarm from the host's render-queue edge, before the page is composed.
 // PON costs a measured 127 ms on this panel (3-6x the SSD1677 ramp, and BTST is
 // already at the datasheet minimum), so it is commanded WITHOUT waiting: the
 // ramp then runs concurrently with the host's CPU-side composition instead of
-// landing on the critical path inside displayStart(). _isScreenOn is claimed
-// immediately so the display paths skip their own PON, and _ponPending makes the
-// first of them ride the remainder of the ramp out through bus.waitBusy() —
-// which keeps the wait inside the host's light-sleep busy-slice hook, same as
-// every other wait here.
+// landing on the critical path inside displayStart(). _ponPending is what makes
+// the first display path ride the remainder of the ramp out, through
+// settlePrewarm()'s bus.waitBusy() — which keeps the wait inside the host's
+// light-sleep busy-slice hook, same as every other wait here.
+//
+// _isScreenOn is deliberately NOT claimed here. It records that the rails are
+// up, and at this instant nobody knows that: an unwaited command can be
+// discarded by a controller that is still busy, and claiming success anyway
+// made settlePrewarm() a no-op, made every downstream `if (!_isScreenOn) PON`
+// skip its own power-on, and ran the activation on dead rails while the
+// bookkeeping recorded a success. settlePrewarm() sets it, once it has watched
+// the ramp happen. _ponPending is therefore also the double-issue guard —
+// _isScreenOn no longer covers the issued-but-not-settled window.
 void Uc8179Driver::beginDisplayWork() {
-  if (_isScreenOn || _bus == nullptr) return;
+  if (_ponPending || _isScreenOn || _bus == nullptr) return;
   _bus->cmd(CMD_POWER_ON);
-  _isScreenOn = true;
   _ponPending = true;
 }
 #endif
