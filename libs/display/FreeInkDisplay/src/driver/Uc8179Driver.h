@@ -80,6 +80,15 @@ class Uc8179Driver : public PanelDriver {
   // with the displayed B/W base to recover Factory.bin's absolute 2-bit planes,
   // then sends plane0 -> DTM 0x10 and plane1 -> DTM 0x13. Full-buffer path only
   // (supportsStripGrayscale stays false; conversion needs the complete base).
+  // display() routes the Fast B/W paint that follows an AA page through
+  // transitionGrayscaleBase() (stock XTF_PRE_BW_MID). That waveform re-drives
+  // every pixel from the retained previous base: changed pixels get the full
+  // 25-frame single-polarity drive, and unchanged ones get the OEM's corrective
+  // kick (4 frames toward black on KK, 1 toward white on WW) which cancels the
+  // 2-frame gray drive the AA pass applied. The correction is per-pixel, so a
+  // photo's large gray areas cost exactly what AA text edges cost. Hosts
+  // therefore do not need to force a clean refresh after a grayscale page.
+  bool fastAfterGrayscaleSafe() const override { return true; }
   void displayGrayscaleBase(EpdBus& bus, const uint8_t* fb, RefreshMode fallback, bool turnOff) override;
   void preconditionGrayscale(EpdBus& bus, uint16_t x, uint16_t y, uint16_t w, uint16_t h) override;
   void copyGrayscaleLsb(EpdBus& bus, const uint8_t* lsb) override;
