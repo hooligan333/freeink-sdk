@@ -381,6 +381,9 @@ void Uc8179Driver::streamPlane(EpdBus& bus, uint8_t ramCmd, const uint8_t* fb, b
 }
 
 void Uc8179Driver::streamPlaneXor(EpdBus& bus, uint8_t ramCmd, const uint8_t* lhs, const uint8_t* rhs) {
+#ifdef FREEINK_UC8179_LEAN_STREAMS
+  if (ramCmd == CMD_DTM1) _dtm1Stale = false;  // as in streamPlane(): a write discharges the debt
+#endif
   uint8_t row[128];
   const uint16_t wb = _wb <= sizeof(row) ? _wb : sizeof(row);
   bus.cmd(ramCmd);
@@ -472,6 +475,10 @@ bool Uc8179Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t* p
       streamPlane(bus, CMD_DTM1, fb, /*invert=*/true);
     } else {
       // Full/forced-first flash retains the known absolute-from-white behavior.
+      // This is the one DTM1 write in the driver that does not go through
+      // streamPlane(), so it does not clear _dtm1Stale itself — it does not have
+      // to: reaching this branch means `fast` was false, which is exactly the
+      // case the _dtm1Stale block at the top of this function already discharged.
       bus.fillPlane(CMD_DTM1, 0xFF, _tresH, _wb);
     }
   }
@@ -525,6 +532,9 @@ void Uc8179Driver::startBwRefresh(EpdBus& bus, bool fast) {
 }
 
 void Uc8179Driver::displayFinish(EpdBus& bus, const uint8_t* fb) {
+#ifdef FREEINK_UC8179_RAIL_POWEROFF
+  settlePrewarm(bus);
+#endif
   if (!_pendingRefresh) return;
   _pendingRefresh = false;
   if (_pendingGrayBase) {
@@ -700,6 +710,9 @@ void Uc8179Driver::beginGrayscale(EpdBus& bus, const uint8_t* fb, GrayscaleMode 
 }
 
 void Uc8179Driver::copyGrayscaleLsb(EpdBus& bus, const uint8_t* lsb) {
+#ifdef FREEINK_UC8179_RAIL_POWEROFF
+  settlePrewarm(bus);
+#endif
   if (_textAa.active()) { _textAa.stage(0, lsb, 0, _h); return; }
   if (!lsb) return;
   if (_absoluteInput) {
@@ -733,6 +746,9 @@ void Uc8179Driver::copyGrayscaleLsb(EpdBus& bus, const uint8_t* lsb) {
 }
 
 void Uc8179Driver::copyGrayscaleMsb(EpdBus& bus, const uint8_t* msb) {
+#ifdef FREEINK_UC8179_RAIL_POWEROFF
+  settlePrewarm(bus);
+#endif
   if (_textAa.active()) { _textAa.stage(1, msb, 0, _h); return; }
   if (!msb) return;
   if (_absoluteInput) {
@@ -770,6 +786,9 @@ void Uc8179Driver::writeGrayscalePlaneStrip(EpdBus& bus, GrayPlane plane, const 
 
 void Uc8179Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, const unsigned char* lut,
                                bool factoryMode) {
+#ifdef FREEINK_UC8179_RAIL_POWEROFF
+  settlePrewarm(bus);
+#endif
   if (_textAa.active()) {
     if (!_textAa.compose()) { _textAa.invalidate(); _needFullClear = true; return; }
     bus.waitBusy("8179 text ready");
@@ -897,7 +916,13 @@ void Uc8179Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, con
     // transitionGrayscaleBase() streams DTM2 before runGrayscalePrecondition()
     // (its only caller), which is also the whole sleep/screensaver route;
     // copyGrayscaleMsb() streams DTM2 for the next AA page; deepSleep() reads no
-    // plane at all; and cleanupGrayscaleBuffers()'s fallback rewrites both. The
+    // plane at all; and cleanupGrayscaleBuffers()'s fallback rewrites both.
+    // displayGrayCalibration() was audited and excluded rather than covered: it
+    // is PanelDriver's base implementation (this driver does not override it)
+    // and has no caller anywhere in the SDK or in CrossPoint, so it cannot
+    // observe the missing restore. Wiring it up later would mean feeding it
+    // planes through copyGrayscaleLsb/Msb first, which write DTM1 and DTM2
+    // themselves — so it would still never read a stale NEW plane. The
     // "stale gray selector" the comment above guards against therefore never
     // reaches a DRF. _bwPlanesSynced accordingly means the baseline is coherent
     // for whatever refresh comes next, which is what its one consumer
@@ -927,6 +952,9 @@ void Uc8179Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, con
 }
 
 void Uc8179Driver::cleanupGrayscaleBuffers(EpdBus& bus, const uint8_t* bw) {
+#ifdef FREEINK_UC8179_RAIL_POWEROFF
+  settlePrewarm(bus);
+#endif
   if (_textAa.active()) {
     // A skipped AA pass still owes the caller its deferred B/W page.
     display(bus, bw ? bw : _textAa.base(), nullptr, RefreshMode::Fast, true);
