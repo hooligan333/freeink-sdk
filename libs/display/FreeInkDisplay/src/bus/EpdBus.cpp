@@ -251,9 +251,13 @@ void EpdBus::waitBusy(BusyPolarity p, const char* tag) {
   } else if (p == BusyPolarity::UcIdleHigh) {
     // X4 Pro UC8179/UC8279 production behavior: allow one RTOS tick for the
     // command to take effect, then wait only for the documented idle level.
-    // There is deliberately no fixed millisecond timeout on this controller
-    // path; issuing the next command while BUSY_N is still LOW can make the UC
-    // controller discard plane or LUT writes.
+    // There is deliberately no *waveform-length* timeout on this controller
+    // path — issuing the next command while BUSY_N is still LOW can make the UC
+    // controller discard plane or LUT writes, so the wait must never give up on
+    // a slow-but-legitimate refresh. The 30 s backstop below is the same runaway
+    // guard every other polarity carries: an order of magnitude beyond the
+    // longest waveform this family runs (~2 s), so it can only be reached by a
+    // stuck BUSY line, where returning beats hanging the render task forever.
     delay(1);
     while (digitalRead(_pins.busy) == LOW) {
       busyIdle(longWait, LOW, 1);
@@ -264,6 +268,7 @@ void EpdBus::waitBusy(BusyPolarity p, const char* tag) {
           _busyWaitBeginHook();
         }
       }
+      if (millis() - start > 30000) break;
     }
   } else {  // X3TwoPhase: wait for the LOW edge, then wait back to HIGH
     while (digitalRead(_pins.busy) == HIGH) {
