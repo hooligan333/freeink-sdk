@@ -30,7 +30,11 @@ class EpdBus {
   void cmdData2(uint8_t c, uint8_t a, uint8_t b) { cmd(c); data(a); data(b); }
   void cmdData(uint8_t c, const uint8_t* p, uint16_t n) { cmd(c); data(p,n); }
   void reset(uint16_t=0) {}
-  void waitBusy(const char* =nullptr) { assert(!transaction); ++waits; }
+  // Mirrors the real EpdBus: waitBusy() reports whether BUSY was ever observed
+  // asserted, so a caller can tell a real wait from a fall-through. Stubbed true
+  // (the normal-hardware case) — the assertion-grace branches that consume it
+  // are the ones under test here.
+  bool waitBusy(const char* =nullptr) { assert(!transaction); ++waits; return true; }
   void waitRefreshComplete(const char* =nullptr) { assert(!transaction); ++waits; }
   bool isBusy() const { return false; }
   EpdPins pins() const { return {}; }
