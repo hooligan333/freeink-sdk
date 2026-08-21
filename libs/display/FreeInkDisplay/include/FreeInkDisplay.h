@@ -150,6 +150,13 @@ class FreeInkDisplay {
   // afterwards. Pass the mode the pass actually used — the guarantee is
   // mode-bound. See PanelDriver::fastAfterGrayscaleSafe().
   bool fastAfterGrayscaleSafe(GrayscaleMode mode = GrayscaleMode::Overlay) const;
+#ifdef FREEINK_UC8179_DOUBLE_GRAY_PRE
+  // One-shot hint for the NEXT base transition: spend extra panel time
+  // equalizing black depth so the previous page cannot ghost through this
+  // page's grays. Call just before the base display of a page with large gray
+  // areas (an image page). See PanelDriver::requestDeepGrayEqualize().
+  void requestDeepGrayEqualize();
+#endif
   // Restore controller RAM and frameBuffer to the given BW baseline after
   // grayscale. Available in both buffer modes (CrossPoint's dual-buffer HAL
   // wraps it directly).
