@@ -982,6 +982,15 @@ bool FreeInkDisplay::fastAfterGrayscaleSafe(GrayscaleMode mode) const {
   return _driver->fastAfterGrayscaleSafe(mode);
 }
 
+#ifdef FREEINK_UC8179_DOUBLE_GRAY_PRE
+void FreeInkDisplay::requestDeepGrayEqualize() {
+  // Same gate as the grayscale capability queries above: the grayscale entry
+  // points no-op while inverted, so there is no gray charge for the corrective
+  // pass to equalize and the hint would only buy a wasted activation.
+  if (!_inverted && _driver) _driver->requestDeepGrayEqualize();
+}
+#endif
+
 void FreeInkDisplay::cleanupGrayscaleBuffers(const uint8_t* bwBuffer) {
   cancelGrayscalePass();
   syncPendingAsync();
