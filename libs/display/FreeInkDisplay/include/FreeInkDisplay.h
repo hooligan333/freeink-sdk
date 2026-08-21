@@ -145,6 +145,11 @@ class FreeInkDisplay {
   // True when displayGrayscaleBase() defers the base activation so the gray
   // planes join it in one waveform (Paper Mono) - see PanelDriver.
   bool combinesGrayscaleBase() const;
+  // True when a Fast refresh issued right after a grayscale pass in `mode` fully
+  // re-drives the gray charge, so the host need not force a clean refresh
+  // afterwards. Pass the mode the pass actually used — the guarantee is
+  // mode-bound. See PanelDriver::fastAfterGrayscaleSafe().
+  bool fastAfterGrayscaleSafe(GrayscaleMode mode = GrayscaleMode::Overlay) const;
   // Restore controller RAM and frameBuffer to the given BW baseline after
   // grayscale. Available in both buffer modes (CrossPoint's dual-buffer HAL
   // wraps it directly).
