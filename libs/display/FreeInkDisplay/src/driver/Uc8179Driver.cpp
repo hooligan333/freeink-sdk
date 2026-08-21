@@ -154,6 +154,12 @@ void Uc8179Driver::initController(EpdBus& bus) {
   _bwPlanesSynced = false;
   _grayBaseValid = false;
   _absoluteGrayPlanes = false;
+#ifdef FREEINK_UC8179_RAIL_POWEROFF
+  _ponPending = false;
+#endif
+#ifdef FREEINK_UC8179_LEAN_STREAMS
+  _dtm1Stale = false;
+#endif
 }
 
 void Uc8179Driver::begin(EpdBus& bus) {
@@ -161,6 +167,9 @@ void Uc8179Driver::begin(EpdBus& bus) {
   if (_grayBase == nullptr) {
     _grayBase = static_cast<uint8_t*>(heap_caps_malloc(_bufferSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   }
+#endif
+#ifdef FREEINK_UC8179_RAIL_POWEROFF
+  _bus = &bus;  // beginDisplayWork() takes no bus parameter; see the header
 #endif
   bus.reset(50);
   initController(bus);
@@ -181,6 +190,16 @@ void Uc8179Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, 
 
 void Uc8179Driver::transitionGrayscaleBase(EpdBus& bus, const uint8_t* fb, bool turnOff) {
   if (!fb) return;
+#ifdef FREEINK_UC8179_RAIL_POWEROFF
+  settlePrewarm(bus);
+#endif
+#ifdef FREEINK_UC8179_LEAN_STREAMS
+  // XTF_PRE_BW_MID drives DTM1 (previous base) against DTM2 (new base), so any
+  // deferred OLD-plane restore has to land before _grayBase is overwritten with
+  // this page's snapshot. Normally already discharged by the AA upload of the
+  // page that deferred it, so this costs nothing on the reading path.
+  flushPendingOldPlane(bus);
+#endif
   _grayBaseValid = false;
   _absoluteGrayPlanes = false;
   if (_grayBase != nullptr) {
@@ -198,7 +217,19 @@ void Uc8179Driver::transitionGrayscaleBase(EpdBus& bus, const uint8_t* fb, bool 
   // Keep the generic B/W baseline coherent in case no AA pass follows (Home or
   // a menu). An AA upload may immediately overwrite these planes; its cached
   // B/W snapshot above remains intact.
+#ifdef FREEINK_UC8179_LEAN_STREAMS
+  // ...and on the reading path an AA upload always does, which made this 60 KB
+  // stream (~26-30 ms at 20 MHz) dead work on every anti-aliased page. Owe it
+  // instead: _grayBase holds the frame, and the handful of consumers that read
+  // DTM1 as the OLD plane flush the debt before they need it.
+  if (_grayBaseValid) {
+    _dtm1Stale = true;
+  } else {
+    streamPlane(bus, CMD_DTM1, fb);  // no snapshot to restore from later
+  }
+#else
   streamPlane(bus, CMD_DTM1, fb);
+#endif
   _oldPlaneValid = true;
   _bwPlanesSynced = true;
   _redriveAfterGray = false;
@@ -234,6 +265,9 @@ void Uc8179Driver::displayGrayscaleBase(EpdBus& bus, const uint8_t* fb, RefreshM
 // reversal. SHL in PSR handles the horizontal panel direction for FreeInk's
 // framebuffer convention. White padding fills the non-visible gates.
 void Uc8179Driver::streamPlane(EpdBus& bus, uint8_t ramCmd, const uint8_t* fb, bool invert) {
+#ifdef FREEINK_UC8179_LEAN_STREAMS
+  if (ramCmd == CMD_DTM1) _dtm1Stale = false;  // a write discharges any deferred restore
+#endif
   if (invert) {
     bus.sendPlaneFlippedInverted(ramCmd, fb, _h, _wb);
   } else {
@@ -242,7 +276,18 @@ void Uc8179Driver::streamPlane(EpdBus& bus, uint8_t ramCmd, const uint8_t* fb, b
   uint8_t whiteRow[128];
   const uint16_t wb = _wb <= sizeof(whiteRow) ? _wb : sizeof(whiteRow);
   memset(whiteRow, 0xFF, wb);
+#ifdef FREEINK_UC8179_LEAN_STREAMS
+  // The 120 non-visible gate rows used to be 120 EpdBus::data() calls, each a
+  // full SPI begin/endTransaction with its own CS pulse. Same bytes on the
+  // wire, one burst — matching how sendPlaneFlipped() streams the visible rows.
+  if (_h < _tresH) {
+    bus.beginTxn();
+    for (uint16_t y = _h; y < _tresH; y++) bus.rawWriteBytes(whiteRow, wb);
+    bus.endTxn();
+  }
+#else
   for (uint16_t y = _h; y < _tresH; y++) bus.data(whiteRow, wb);
+#endif
 }
 
 void Uc8179Driver::streamPlaneXor(EpdBus& bus, uint8_t ramCmd, const uint8_t* lhs, const uint8_t* rhs) {
@@ -257,11 +302,36 @@ void Uc8179Driver::streamPlaneXor(EpdBus& bus, uint8_t ramCmd, const uint8_t* lh
   }
   bus.endTxn();
   memset(row, 0xFF, wb);
+#ifdef FREEINK_UC8179_LEAN_STREAMS
+  if (_h < _tresH) {  // one burst for the gate padding, as in streamPlane()
+    bus.beginTxn();
+    for (uint16_t y = _h; y < _tresH; y++) bus.rawWriteBytes(row, wb);
+    bus.endTxn();
+  }
+#else
   for (uint16_t y = _h; y < _tresH; y++) bus.data(row, wb);
+#endif
 }
 
 bool Uc8179Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) {
   (void)prev;
+#ifdef FREEINK_UC8179_RAIL_POWEROFF
+  // Unlike every other entry point here, this one writes controller RAM before
+  // its first waitBusy — ride out a prewarm ramp before the plane stream below.
+  settlePrewarm(bus);
+#endif
+#ifdef FREEINK_UC8179_LEAN_STREAMS
+  // Only the differential DU branch reads DTM1 as the OLD plane; the Full/Half
+  // branches rewrite it a few lines down, as does a dark-background Fast. Settle
+  // the debt here, before _grayBase is repurposed as this frame's snapshot.
+  if (_dtm1Stale) {
+    if (mode == RefreshMode::Fast && !_needFullClear && _oldPlaneValid && !_darkBackground) {
+      flushPendingOldPlane(bus);
+    } else {
+      _dtm1Stale = false;
+    }
+  }
+#endif
   _bwPlanesSynced = false;
   _absoluteGrayPlanes = false;
   _grayBaseValid = false;
@@ -391,8 +461,14 @@ void Uc8179Driver::requestResync(uint8_t settlePasses) {
 void Uc8179Driver::skipInitialResync() { _needFullClear = false; }
 
 void Uc8179Driver::deepSleep(EpdBus& bus) {
+#ifdef FREEINK_UC8179_RAIL_POWEROFF
+  settlePrewarm(bus);  // never POF into a ramp still in progress
+#endif
   _grayBaseValid = false;
   _absoluteGrayPlanes = false;
+#ifdef FREEINK_UC8179_LEAN_STREAMS
+  _dtm1Stale = false;  // DSLP clears controller RAM; nothing left to restore into
+#endif
   if (_isScreenOn) {
     bus.cmd(CMD_POWER_OFF);
     bus.waitBusy(" 8179 power-down");
@@ -561,7 +637,22 @@ void Uc8179Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, con
   // selector plane from being reused by a later refresh (especially sleep).
   if (_grayBaseValid) {
     streamPlane(bus, CMD_DTM1, _grayBase);
+#ifndef FREEINK_UC8179_LEAN_STREAMS
     streamPlane(bus, CMD_DTM2, _grayBase);
+#else
+    // The DTM2 half of that restore is provably dead on this driver, so the AA
+    // page does not pay its 60 KB (~26-30 ms). Every path that can follow
+    // displayGray() writes the NEW plane before it is ever activated:
+    // displayStart() streams DTM2 as its first act on both branches;
+    // transitionGrayscaleBase() streams DTM2 before runGrayscalePrecondition()
+    // (its only caller), which is also the whole sleep/screensaver route;
+    // copyGrayscaleMsb() streams DTM2 for the next AA page; deepSleep() reads no
+    // plane at all; and cleanupGrayscaleBuffers()'s fallback rewrites both. The
+    // "stale gray selector" the comment above guards against therefore never
+    // reaches a DRF. _bwPlanesSynced accordingly means the baseline is coherent
+    // for whatever refresh comes next, which is what its one consumer
+    // (cleanupGrayscaleBuffers) actually asks.
+#endif
     _oldPlaneValid = true;
     _bwPlanesSynced = true;
     _needFullClear = false;
@@ -579,6 +670,13 @@ void Uc8179Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, con
 
 void Uc8179Driver::cleanupGrayscaleBuffers(EpdBus& bus, const uint8_t* bw) {
   bus.waitBusy(" 8179_gray_cleanup");
+#ifdef FREEINK_UC8179_LEAN_STREAMS
+  // Gray exit is a baseline consumer, and it drops _grayBase below — settle any
+  // deferred OLD-plane restore while the frame it owes is still available. A
+  // normal AA page discharged it at copyGrayscaleLsb(), so this is only reached
+  // when a gray sequence was abandoned between base and planes.
+  flushPendingOldPlane(bus);
+#endif
   _grayBaseValid = false;
   _absoluteGrayPlanes = false;
   if (!bw) {
@@ -596,6 +694,68 @@ void Uc8179Driver::cleanupGrayscaleBuffers(EpdBus& bus, const uint8_t* bw) {
   _bwPlanesSynced = true;
   _needFullClear = false;
 }
+
+#ifdef FREEINK_UC8179_LEAN_STREAMS
+void Uc8179Driver::flushPendingOldPlane(EpdBus& bus) {
+  if (!_dtm1Stale) return;
+  _dtm1Stale = false;
+  if (_grayBase != nullptr && _grayBaseValid) {
+    // Own wait rather than relying on the caller's: this runs ahead of the
+    // point where each caller would otherwise settle the controller, and the
+    // UC8179 drops RAM writes issued while BUSY_N is low.
+    bus.waitBusy(" 8179_old_plane_flush");
+    streamPlane(bus, CMD_DTM1, _grayBase);
+    _bwPlanesSynced = true;
+    return;
+  }
+  // Unreachable by construction: the debt is only taken on with a valid
+  // snapshot, and every site that drops _grayBaseValid either writes DTM1 or
+  // flushes first. Kept as a fence — DTM1 would otherwise still hold the page
+  // before last, which a differential would ghost straight through.
+  _oldPlaneValid = false;
+  _bwPlanesSynced = false;
+  _needFullClear = true;
+}
+#endif
+
+#ifdef FREEINK_UC8179_RAIL_POWEROFF
+void Uc8179Driver::settlePrewarm(EpdBus& bus) {
+  if (!_ponPending) return;
+  _ponPending = false;
+  bus.waitBusy(" 8179_prewarm_PON");
+}
+
+// Park the analog rails once the host's controller-work queue has drained. POF
+// is the whole sequence: PFS (0x20 = 3 frames) runs the documented power-off
+// ramp, and the controller keeps its registers, its PSR LUT-mode selection, any
+// uploaded LUT tables and both RAM planes across it — deepSleep() has always
+// relied on that, and displayStart()/runGrayscalePrecondition()/displayGray()
+// each re-assert CDI, CCSET, TSSET and PSR in their own setup block before the
+// next PON regardless. So nothing has to be re-armed here.
+void Uc8179Driver::controllerIdle(EpdBus& bus) {
+  settlePrewarm(bus);
+  if (!_isScreenOn) return;  // idempotent: no SPI at all once the rails are down
+  bus.cmd(CMD_POWER_OFF);
+  bus.waitBusy(" 8179_idle_POF");
+  _isScreenOn = false;
+}
+
+// Rail prewarm from the host's input dispatch, before the page is composed.
+// PON costs a measured 127 ms on this panel (3-6x the SSD1677 ramp, and BTST is
+// already at the datasheet minimum), so it is commanded WITHOUT waiting: the
+// ramp then runs concurrently with the host's CPU-side composition instead of
+// landing on the critical path inside displayStart(). _isScreenOn is claimed
+// immediately so the display paths skip their own PON, and _ponPending makes the
+// first of them ride the remainder of the ramp out through bus.waitBusy() —
+// which keeps the wait inside the host's light-sleep busy-slice hook, same as
+// every other wait here.
+void Uc8179Driver::beginDisplayWork() {
+  if (_isScreenOn || _bus == nullptr) return;
+  _bus->cmd(CMD_POWER_ON);
+  _isScreenOn = true;
+  _ponPending = true;
+}
+#endif
 
 // Per-board config injection, same idiom as the other drivers: define
 // `const Uc8179Config& yourConfig();` in namespace freeink and build with
