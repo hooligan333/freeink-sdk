@@ -100,6 +100,17 @@ class Uc8179Driver : public PanelDriver {
   void displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, const unsigned char* lut, bool factoryMode) override;
   void cleanupGrayscaleBuffers(EpdBus& bus, const uint8_t* bw) override;
 
+#ifdef FREEINK_UC8179_RAIL_POWEROFF
+  // --- analog rail parking (booster / VGH / VGL / VSH / VSL / VCOM) ---
+  // Nothing on this controller ever asks for turnOff (displayGray() discards it
+  // for stock parity), so without these two hooks the rails latch ON at the
+  // first refresh and stay on for the whole reading session. Registers, the
+  // LUT-mode selection and both RAM planes survive a POF — only DSLP loses them,
+  // which is why deepSleep() can already power off and back on freely.
+  void controllerIdle(EpdBus& bus) override;
+  void beginDisplayWork() override;
+#endif
+
  private:
   void initController(EpdBus& bus);
   // Stream a framebuffer into a RAM plane (ramCmd): reverse row order, use PSR
@@ -117,6 +128,17 @@ class Uc8179Driver : public PanelDriver {
   // after AA. The generic reader path does not call displayGrayscaleBase(), so
   // display() routes its post-AA Fast base here as well.
   void transitionGrayscaleBase(EpdBus& bus, const uint8_t* fb, bool turnOff);
+#ifdef FREEINK_UC8179_RAIL_POWEROFF
+  // Ride out a prewarm PON that beginDisplayWork() fired without waiting. Every
+  // path that touches the controller after a prewarm calls this first: the
+  // UC8179 discards RAM/LUT/DRF writes while BUSY_N is low.
+  void settlePrewarm(EpdBus& bus);
+#endif
+#ifdef FREEINK_UC8179_LEAN_STREAMS
+  // Stream the OLD-plane restore that transitionGrayscaleBase() deferred (see
+  // _dtm1Stale). No-op when nothing is owed.
+  void flushPendingOldPlane(EpdBus& bus);
+#endif
 
   const Uc8179Config& _cfg;
 
@@ -160,6 +182,26 @@ class Uc8179Driver : public PanelDriver {
   bool _pendingRefresh = false;
   bool _pendingTurnOff = false;
   bool _pendingPartial = false;  // this refresh used the PTIN/PTOUT partial path
+
+#ifdef FREEINK_UC8179_RAIL_POWEROFF
+  // beginDisplayWork() has no bus parameter (PanelDriver's signature), so the
+  // bus handed to begin() is kept for the prewarm PON. The facade owns exactly
+  // one bus for the lifetime of the driver.
+  EpdBus* _bus = nullptr;
+  // A PON was commanded but not waited on, so the ~127 ms rail ramp overlaps the
+  // host's CPU-side page composition. Cleared by settlePrewarm().
+  bool _ponPending = false;
+#endif
+#ifdef FREEINK_UC8179_LEAN_STREAMS
+  // The controller's OLD plane (DTM1) does NOT hold the most recently displayed
+  // B/W base: transitionGrayscaleBase() skipped its restore because an AA pass
+  // normally overwrites DTM1 within microseconds anyway. Strictly orthogonal to
+  // _oldPlaneValid, which says a legal baseline exists at all: with _dtm1Stale
+  // set, DTM1 still holds the page BEFORE the one just painted, and the owed
+  // frame lives in _grayBase. Any consumer that reads DTM1 as the OLD plane
+  // flushes first; any write to DTM1 discharges the debt.
+  bool _dtm1Stale = false;
+#endif
 };
 
 PanelDriver& uc8179Driver();
