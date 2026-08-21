@@ -131,7 +131,11 @@ class Uc8179Driver : public PanelDriver {
 #ifdef FREEINK_UC8179_RAIL_POWEROFF
   // Ride out a prewarm PON that beginDisplayWork() fired without waiting. Every
   // path that touches the controller after a prewarm calls this first: the
-  // UC8179 discards RAM/LUT/DRF writes while BUSY_N is low.
+  // UC8179 discards RAM/LUT/DRF writes while BUSY_N is low. That is an
+  // invariant, not a convention — every public entry point that reaches the bus
+  // (display*/copyGrayscale*/cleanupGrayscaleBuffers/deepSleep/controllerIdle)
+  // opens with this call, so _ponPending can never survive into a bus write.
+  // Free when nothing is pending.
   void settlePrewarm(EpdBus& bus);
 #endif
 #ifdef FREEINK_UC8179_LEAN_STREAMS
