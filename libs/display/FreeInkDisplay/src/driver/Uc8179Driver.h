@@ -246,6 +246,11 @@ class Uc8179Driver : public PanelDriver {
   // — a different post-activation pipeline (PTOUT, idle CDI, OLD-plane
   // handling, the optional equalize pass) and a different frame source.
   bool _pendingGrayBase = false;
+  // Wall-clock stamp of the last base-activation completion; displayGray()
+  // enforces GRAY_SETTLE_MS of pigment relaxation from this point before the
+  // AA activation fires (see the settle comment there). 0 = never stamped.
+  static constexpr unsigned long GRAY_SETTLE_MS = 190;
+  unsigned long _baseActivationDoneMs = 0;
   // transitionGrayscaleBase()'s `turnOff` argument, carried across the split to
   // the POF tail that consumes it.
   bool _pendingGrayBaseTurnOff = false;
