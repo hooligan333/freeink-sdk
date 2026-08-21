@@ -110,6 +110,13 @@ class FreeInkDisplay {
   // True when displayGrayscaleBase() defers the base activation so the gray
   // planes join it in one waveform (Paper Mono) - see PanelDriver.
   bool combinesGrayscaleBase() const;
+#ifdef FREEINK_UC8179_DOUBLE_GRAY_PRE
+  // One-shot hint for the NEXT base transition: spend extra panel time
+  // equalizing black depth so the previous page cannot ghost through this
+  // page's grays. Call just before the base display of a page with large gray
+  // areas (an image page). See PanelDriver::requestDeepGrayEqualize().
+  void requestDeepGrayEqualize();
+#endif
   // Restore controller RAM and frameBuffer to the given BW baseline after
   // grayscale. Available in both buffer modes (CrossPoint's dual-buffer HAL
   // wraps it directly).

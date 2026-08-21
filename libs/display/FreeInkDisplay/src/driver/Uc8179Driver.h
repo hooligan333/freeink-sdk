@@ -111,6 +111,10 @@ class Uc8179Driver : public PanelDriver {
   void beginDisplayWork() override;
 #endif
 
+#ifdef FREEINK_UC8179_DOUBLE_GRAY_PRE
+  void requestDeepGrayEqualize() override;
+#endif
+
  private:
   void initController(EpdBus& bus);
   // Stream a framebuffer into a RAM plane (ramCmd): reverse row order, use PSR
@@ -122,8 +126,10 @@ class Uc8179Driver : public PanelDriver {
   void streamPlaneXor(EpdBus& bus, uint8_t ramCmd, const uint8_t* lhs, const uint8_t* rhs);
   // Run the vendor XTF_PRE_BW_MID transition with the previous B/W base in
   // DTM1 and the new base in DTM2. It replaces the ordinary B/W activation and
-  // leaves analog power on for the AA pass that follows.
-  void runGrayscalePrecondition(EpdBus& bus);
+  // leaves analog power on for the AA pass that follows. `drfTag` names the
+  // activation in the serial busy-wait timing print, so a repeated pass can be
+  // measured separately.
+  void runGrayscalePrecondition(EpdBus& bus, const char* drfTag = " 8179_gray_pre_DRF");
   // Blocking, non-flashing B/W transition used by a Fast page immediately
   // after AA. The generic reader path does not call displayGrayscaleBase(), so
   // display() routes its post-AA Fast base here as well.
@@ -205,6 +211,25 @@ class Uc8179Driver : public PanelDriver {
   // frame lives in _grayBase. Any consumer that reads DTM1 as the OLD plane
   // flushes first; any write to DTM1 discharges the debt.
   bool _dtm1Stale = false;
+#endif
+#ifdef FREEINK_UC8179_DOUBLE_GRAY_PRE
+  // One-shot: the next base transition runs the XTF_PRE_BW_MID corrective a
+  // second time with DTM1 == DTM2, equalizing black depth so the previous page's
+  // text cannot ghost through this page's grays (see transitionGrayscaleBase()).
+  // Set by requestDeepGrayEqualize(), which the host calls just before the base
+  // display of an image page.
+  //
+  // Staleness is impossible by construction rather than by convention: the only
+  // two functions in this driver that activate a B/W base are
+  // transitionGrayscaleBase() and displayStart(), and BOTH clear the flag —
+  // the first by consuming it, the second by discarding it. display() picks
+  // exactly one of the two; displayGrayscaleBase() and displayWindow() route
+  // through display(); and initController() clears it across begin()/wake. So
+  // the flag is always answered by the first base activation after it is set,
+  // and no later page can observe it. Nothing between the hint and that
+  // activation can activate a base either: displayGray(), copyGrayscale*() and
+  // cleanupGrayscaleBuffers() all follow the base, never precede it.
+  bool _deepEqualizeNext = false;
 #endif
 };
 

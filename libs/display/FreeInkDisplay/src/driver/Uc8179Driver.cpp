@@ -160,6 +160,9 @@ void Uc8179Driver::initController(EpdBus& bus) {
 #ifdef FREEINK_UC8179_LEAN_STREAMS
   _dtm1Stale = false;
 #endif
+#ifdef FREEINK_UC8179_DOUBLE_GRAY_PRE
+  _deepEqualizeNext = false;
+#endif
 }
 
 void Uc8179Driver::begin(EpdBus& bus) {
@@ -234,6 +237,51 @@ void Uc8179Driver::transitionGrayscaleBase(EpdBus& bus, const uint8_t* fb, bool 
   _bwPlanesSynced = true;
   _redriveAfterGray = false;
   _needFullClear = false;
+
+#ifdef FREEINK_UC8179_DOUBLE_GRAY_PRE
+  // One XTF_PRE_BW_MID pass leaves blacks at two different depths. In the
+  // old->new transition a was-white pixel that becomes black takes WK (25 frames
+  // VDH, saturating) while a was-black pixel that stays black takes only the KK
+  // corrective (4 frames VDH), and the AA waveform's gray drive is a mere ~2
+  // frames off black — so the previous page's text pattern survives as density
+  // variation inside the new page's gray areas. Visible as text ghosting through
+  // an image page's grays.
+  //
+  // Running the precondition a SECOND time with DTM1 == DTM2 == the new base
+  // fires only the KK/WW correctives, uniformly across the panel, equalizing
+  // black depth before the AA planes land. No RAM plane is touched by the
+  // activation, so DTM1/DTM2 and every flag above stay exactly as the
+  // single-pass path left them; the pass also re-arms the registers it needs
+  // itself (PTIN + full PTL window, PSR REG=1, PFS/gate-scan, CDI active, CCSET,
+  // TSSET 0x5A and the kGrayPreBwMid LUT set — none of which the first pass tore
+  // down) and exits through the same PTOUT + idle-CDI restore, leaving power on.
+  //
+  // It costs a second full activation (~666 ms measured), which is why it is
+  // opt-in per transition rather than automatic: only a page whose grays are
+  // large enough to show the ghost — an image page — is worth it, and the driver
+  // cannot tell an image page from a text page. The host arms it through
+  // requestDeepGrayEqualize() just before the base display call.
+  //
+  // One-shot: consumed here whether or not the pass ends up running, so a hint
+  // can never carry over into a later page. See the header for the full
+  // staleness argument.
+  if (_deepEqualizeNext) {
+    _deepEqualizeNext = false;
+#ifdef FREEINK_UC8179_LEAN_STREAMS
+    // The equalizing pass is defined by DTM1 == DTM2, and lean streams has just
+    // DEFERRED the DTM1 restore (_dtm1Stale) instead of performing it — DTM1
+    // still holds the page before this one. Settle that debt here, or the second
+    // activation would re-run the old->new transition rather than the corrective
+    // one and drive the changed pixels twice. flushPendingOldPlane() streams
+    // _grayBase, which is this page's base (memcpy'd from fb at the top), so
+    // after it DTM1 and DTM2 agree exactly as they do on the non-lean path.
+    // The ~26-30 ms this gives back is the price of the equalize, paid only on
+    // the pages that asked for it.
+    flushPendingOldPlane(bus);
+#endif
+    runGrayscalePrecondition(bus, " 8179_gray_pre2_DRF");
+  }
+#endif
 
   if (turnOff && _isScreenOn) {
     bus.cmd(CMD_POWER_OFF);
@@ -334,6 +382,18 @@ bool Uc8179Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t* p
       _dtm1Stale = false;
     }
   }
+#endif
+#ifdef FREEINK_UC8179_DOUBLE_GRAY_PRE
+  // The other half of the deep-equalize hint's one-shot contract. This is the
+  // only base activation that does NOT go through transitionGrayscaleBase(), so
+  // consuming it here too means the hint is always answered — used there,
+  // discarded here — by the first base activation that follows it, and can never
+  // be seen by a later page. Discarding is correct rather than a loss: reaching
+  // this function instead means either a Full/Half clearing waveform, which
+  // equalizes black depth by construction, or a differential update with no
+  // grayscale pass behind it (display() only diverts a post-AA Fast) — neither
+  // leaves the uneven black the corrective pass exists to remove.
+  _deepEqualizeNext = false;
 #endif
   _bwPlanesSynced = false;
   _absoluteGrayPlanes = false;
@@ -493,7 +553,7 @@ void Uc8179Driver::deepSleep(EpdBus& bus) {
 // RAM; displayGray() then runs the custom-LUT grayscale waveform. CrossPoint's
 // masks are converted below to Factory.bin's absolute plane0/plane1 encoding;
 // the resulting (DTM1,DTM2) pair selects the WW/BW/WB/BB LUT per pixel.
-void Uc8179Driver::runGrayscalePrecondition(EpdBus& bus) {
+void Uc8179Driver::runGrayscalePrecondition(EpdBus& bus, const char* drfTag) {
   // Factory.bin skips XTF_PRE_BW_MID for its first AA page. Callers must have
   // retained the previous B/W base in DTM1 and loaded the new base into DTM2.
   if (!_oldPlaneValid || !_grayRefreshedOnce) return;
@@ -537,7 +597,7 @@ void Uc8179Driver::runGrayscalePrecondition(EpdBus& bus) {
     _isScreenOn = true;
   }
   bus.cmd(CMD_DISPLAY_REFRESH);
-  bus.waitBusy(" 8179_gray_pre_DRF");
+  bus.waitBusy(drfTag);
   bus.cmd(CMD_PARTIAL_OUT);
   bus.cmd(CMD_VCOM_DATA_INTERVAL);
   bus.data(_cfg.cdiIdle);
@@ -783,6 +843,14 @@ void Uc8179Driver::beginDisplayWork() {
   _isScreenOn = true;
   _ponPending = true;
 }
+#endif
+
+#ifdef FREEINK_UC8179_DOUBLE_GRAY_PRE
+// Arm the deep black-depth equalize for the NEXT base transition only. The host
+// calls this immediately before the base display of a page whose grays are large
+// enough for the uneven-black ghost to show (an image page); text pages leave it
+// unset and keep the single-pass cost.
+void Uc8179Driver::requestDeepGrayEqualize() { _deepEqualizeNext = true; }
 #endif
 
 // Per-board config injection, same idiom as the other drivers: define
