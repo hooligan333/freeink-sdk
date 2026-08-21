@@ -95,6 +95,23 @@ class Uc8179Driver : public PanelDriver {
     return {GrayscaleEncoding::OverlayMasks, GrayscaleBase::Separate, false,
             false, false};
   }
+  // Overlay/Absolute: displayGray() ends with _redriveAfterGray = true, and
+  // display() then routes the following Fast B/W paint through
+  // transitionGrayscaleBase() (stock XTF_PRE_BW_MID) instead of the plain DU
+  // differential. That waveform re-drives every pixel from the retained previous
+  // base: changed pixels get the full 25-frame single-polarity drive, unchanged
+  // ones the OEM's corrective kick (4 frames toward black on KK, 1 toward white
+  // on WW) which cancels the 2-frame gray drive the AA pass applied. The
+  // correction is per-pixel and LUT-selected, so a photo's large gray areas cost
+  // exactly what AA text edges cost. Hosts need no forced clean refresh after a
+  // grayscale page.
+  //
+  // Direct is excluded: beginGrayscale() and displayGray() both leave
+  // _redriveAfterGray = false with _needFullClear = true, so the next B/W paint
+  // is already a full clear and there is no fast-refresh guarantee to offer.
+  bool fastAfterGrayscaleSafe(GrayscaleMode mode = GrayscaleMode::Overlay) const override {
+    return mode == GrayscaleMode::Overlay || mode == GrayscaleMode::Absolute;
+  }
   void beginGrayscale(EpdBus& bus, const uint8_t* fb, GrayscaleMode mode, RefreshMode fallback, bool turnOff) override;
   void copyGrayscaleLsb(EpdBus& bus, const uint8_t* lsb) override;
   void copyGrayscaleMsb(EpdBus& bus, const uint8_t* msb) override;

@@ -123,6 +123,28 @@ class PanelDriver {
   // separate B/W refresh first makes the gray pass re-drive the whole text
   // body through the custom LUT's kick phases (a visible flash).
   virtual bool combinesGrayscaleBase() const { return grayscaleCapabilities().base == GrayscaleBase::Combined; }
+  // True when an ordinary Fast display() issued immediately after a grayscale
+  // pass in `mode` fully re-drives the panel, INCLUDING the intermediate charge
+  // that pass left behind — i.e. the driver internally substitutes a gray-exit
+  // transition for the plain differential update. Hosts that would otherwise
+  // force a clean (flashing) refresh on the page following grayscale content can
+  // then keep their ordinary refresh cadence. The corrective is per-pixel and
+  // LUT-selected, so it is independent of how much of the frame carried gray
+  // (photo areas cost no more than anti-aliased text edges).
+  //
+  // Mode-bound like grayscaleCapabilities(): a driver may re-drive after some
+  // modes and not others (UC8179 leaves Direct on a forced full clear). Callers
+  // pass the mode their pass actually used. Runtime capability: one firmware
+  // image may carry several drivers and pick one at boot.
+  //
+  // Deliberately NOT a GrayscaleCapabilities field: that struct describes the
+  // plane ENCODING a mode accepts and explicitly "does not promise independence
+  // from prior ink", which is the opposite property. Keeping this a separate
+  // query leaves the upstream descriptor untouched.
+  virtual bool fastAfterGrayscaleSafe(GrayscaleMode mode = GrayscaleMode::Overlay) const {
+    (void)mode;
+    return false;
+  }
   // Display `fb` as the base frame for a grayscale overlay that follows.
   // X3 runs the OEM pipeline (the "AA-pre-BW(mid)" bank as a differential
   // base update with calibrated drives); panels without a dedicated base

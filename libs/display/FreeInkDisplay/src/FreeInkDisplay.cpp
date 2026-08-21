@@ -971,6 +971,17 @@ bool FreeInkDisplay::combinesGrayscaleBase() const {
   return grayscaleCapabilities().base == GrayscaleBase::Combined;
 }
 
+bool FreeInkDisplay::fastAfterGrayscaleSafe(GrayscaleMode mode) const {
+  // Inverted rendering no-ops the grayscale entry points, so no gray charge is
+  // ever laid down and the guarantee has nothing to apply to; report false so
+  // hosts keep whatever night-mode path they already had. _inversionDirty means
+  // the next paint is a full re-render, which clears the charge on its own.
+  if (_inverted || _inversionDirty || !_driver) return false;
+  // A mode the driver cannot run never laid down gray charge through this path.
+  if (!grayscaleCapabilities(mode).supported()) return false;
+  return _driver->fastAfterGrayscaleSafe(mode);
+}
+
 void FreeInkDisplay::cleanupGrayscaleBuffers(const uint8_t* bwBuffer) {
   cancelGrayscalePass();
   syncPendingAsync();
