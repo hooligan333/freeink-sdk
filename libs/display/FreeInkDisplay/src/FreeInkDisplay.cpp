@@ -930,7 +930,13 @@ void FreeInkDisplay::skipInitialResync() {
 }
 
 void FreeInkDisplay::beginDisplayWork() {
-  if (_driver) _driver->beginDisplayWork();
+  if (!_driver) return;
+  // Same opening as every other driver-facing entry point here: a deferred
+  // refresh still owns the bus until its displayFinish() runs, and a driver that
+  // touches the panel from this hook (UC8179 fires the rail prewarm PON) must
+  // not slip a command in beside an in-flight waveform.
+  syncPendingAsync();
+  _driver->beginDisplayWork();
 }
 
 void FreeInkDisplay::abortPostRefresh() {
