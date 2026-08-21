@@ -191,6 +191,14 @@ class FreeInkDisplay {
   // can skip overlap scaffolding (e.g. whole-plane grayscale buffers) when
   // there is nothing to overlap.
   bool supportsAsyncRefresh() const;
+#ifdef FREEINK_UC8179_OVERLAP_BASE
+  // True when a pending async refresh keeps its own copy of the frame, so the
+  // caller may rewrite the framebuffer before waitRefreshComplete() instead of
+  // holding it intact. Implies supportsAsyncRefresh(). Lets the whole-buffer
+  // grayscale path reuse the framebuffer as plane scratch while the B/W base
+  // waveform runs. See PanelDriver::asyncRefreshKeepsOwnFrame().
+  bool asyncRefreshKeepsOwnFrame() const;
+#endif
 
   // ------------------------------------------------------------------------
   // CrossPoint EInkDisplay compatibility surface.

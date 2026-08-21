@@ -61,6 +61,22 @@ class PanelDriver {
   // front. Must agree with what displayStart() actually returns.
   virtual bool supportsAsyncDisplay() const { return false; }
 
+#ifdef FREEINK_UC8179_OVERLAP_BASE
+  // True when a refresh deferred by displayStart() carries its own copy of the
+  // frame, so the host may rewrite its framebuffer BEFORE the matching
+  // displayFinish() — a strict relaxation of the shadow-free async contract
+  // documented below and on FreeInkDisplay::displayBufferAsyncNoShadow().
+  //
+  // Default false, and it has to be: displayFinish() classically re-reads `fb`
+  // to rebuild the controller's differential baseline from the just-displayed
+  // frame, which a host that meanwhile reused that framebuffer as scratch would
+  // poison. Only a driver whose post-waveform pipeline restores the baseline
+  // from its own snapshot may report true. Runtime capability, because one
+  // firmware image carries several drivers and probes the panel at boot: hosts
+  // must ask the live driver, never assume from the build.
+  virtual bool asyncRefreshKeepsOwnFrame() const { return false; }
+#endif
+
   // Two-call refresh split (CrossPoint EInkDisplay::triggerDisplay/completeDisplay).
   // For the shadowed async path the facade passes its own baseline copy as
   // `prev`, so the live fb may be redrawn immediately; otherwise `fb` must
