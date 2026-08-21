@@ -690,6 +690,12 @@ void Uc8179Driver::displayFinish(EpdBus& bus, const uint8_t* fb) {
   bus.cmd(CMD_VCOM_DATA_INTERVAL);
   bus.data(_cfg.cdiIdle);  // 0xA9
   bus.data(CDI_INTERVAL);
+#ifdef FREEINK_UC8179_OVERLAP_BASE
+  // Ordinary async bases (HALF cadence pages, first AA page) feed the settle
+  // clock too — a gray pass may follow this activation just as it follows the
+  // gray-exit transition.
+  _baseActivationDoneMs = millis();
+#endif
 
   // Sync the OLD plane (0x10) with the just-displayed frame so the NEXT partial
   // diffs against it (KW clears erased pixels -> no ghosting). This is the piece
@@ -835,6 +841,9 @@ void Uc8179Driver::runGrayscalePreconditionFinish(EpdBus& bus, const char* drfTa
   bus.cmd(CMD_VCOM_DATA_INTERVAL);
   bus.data(_cfg.cdiIdle);
   bus.data(CDI_INTERVAL);
+#ifdef FREEINK_UC8179_OVERLAP_BASE
+  _baseActivationDoneMs = millis();
+#endif
 }
 
 void Uc8179Driver::preconditionGrayscale(EpdBus& bus, uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
@@ -912,6 +921,20 @@ void Uc8179Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, con
   // The base refresh must be fully complete before we upload LUTs / stream — the
   // controller drops LUT/DTM/DRF writes while BUSY.
   bus.waitBusy(" 8179_gray_ready");
+#ifdef FREEINK_UC8179_OVERLAP_BASE
+  // PIGMENT SETTLE (hardware-diagnosed 2026-08-21): the AA gray drive is only
+  // ~2 frames off black, so it has no margin against the residual field the
+  // base transition leaves — black sits at two depths (25-frame WK vs 4-frame
+  // KK) patterned by the OUTGOING page, and the pigment keeps relaxing after
+  // BUSY releases. The pre-overlap build waited ~187 ms here by ACCIDENT (the
+  // plane renders + uploads lived in this gap); the overlap moved the renders
+  // inside the waveform and cut the gap to ~102 ms, and the gray landed on the
+  // unsettled field as a visible patchy monochrome step. Hold the line the old
+  // build held implicitly. No-op whenever host work already covered the gap.
+  if (_baseActivationDoneMs != 0) {
+    while (millis() - _baseActivationDoneMs < GRAY_SETTLE_MS) delay(1);
+  }
+#endif
   _bwPlanesSynced = false;
 
   // Custom-LUT 4-level grayscale — the EXACT stock gray_aa stream (FUN_4214ec2c),
