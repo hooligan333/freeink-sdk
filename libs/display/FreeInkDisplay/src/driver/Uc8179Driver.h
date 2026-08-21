@@ -15,6 +15,9 @@
 //
 // BUSY_N: low while busy (PON/DRF/POF all flag). Production waits one RTOS tick
 // and then polls until BUSY_N is HIGH; it does not require observing a LOW edge.
+// EpdBus adds a bounded wall-clock grace for the assertion itself after a bare
+// command opcode, because that one tick is not a real time budget under
+// tickless idle — see BusyPolarity::UcIdleHigh.
 
 #include "PanelDriver.h"
 
@@ -132,15 +135,18 @@ class Uc8179Driver : public PanelDriver {
   void runGrayscalePrecondition(EpdBus& bus, const char* drfTag = " 8179_gray_pre_DRF");
   // Blocking, non-flashing B/W transition used by a Fast page immediately
   // after AA. The generic reader path does not call displayGrayscaleBase(), so
-  // display() routes its post-AA Fast base here as well.
+  // display() routes its post-AA Fast base here as well. Those two callers are
+  // not interchangeable to the lean-stream path — see _aaUploadFollows.
   void transitionGrayscaleBase(EpdBus& bus, const uint8_t* fb, bool turnOff);
 #ifdef FREEINK_UC8179_RAIL_POWEROFF
-  // Ride out a prewarm PON that beginDisplayWork() fired without waiting. Every
-  // path that touches the controller after a prewarm calls this first: the
-  // UC8179 discards RAM/LUT/DRF writes while BUSY_N is low. That is an
-  // invariant, not a convention — every public entry point that reaches the bus
+  // Ride out a prewarm PON that beginDisplayWork() fired without waiting, and
+  // only then declare the rails up. Every path that touches the controller
+  // after a prewarm calls this first: the UC8179 discards RAM/LUT/DRF writes
+  // while BUSY_N is low. That is an invariant, not a convention — every public
+  // entry point that reaches the bus
   // (display*/copyGrayscale*/cleanupGrayscaleBuffers/deepSleep/controllerIdle)
-  // opens with this call, so _ponPending can never survive into a bus write.
+  // opens with this call, so _ponPending can never survive into a bus write and
+  // no reader of _isScreenOn can observe the issued-but-not-settled window.
   // Free when nothing is pending.
   void settlePrewarm(EpdBus& bus);
 #endif
@@ -168,6 +174,15 @@ class Uc8179Driver : public PanelDriver {
   bool _grayBaseValid = false;
   bool _absoluteGrayPlanes = false;
 
+  // The analog rails are up AND that has been observed — a completed PON whose
+  // BUSY_N ramp was waited out, never a PON merely commanded. Every reader
+  // (displayStart, runGrayscalePrecondition and displayGray to skip or issue a
+  // power-on; transitionGrayscaleBase's turnOff tail, controllerIdle and
+  // deepSleep to decide whether a POF is owed) acts on it, so an optimistic
+  // value silently strands an activation on dead rails. Under
+  // FREEINK_UC8179_RAIL_POWEROFF the issued-but-unobserved window is held by
+  // _ponPending instead, and every one of those readers is preceded by the
+  // settlePrewarm() that closes it.
   bool _isScreenOn = false;
   bool _darkBackground = false;
   // Force the first refresh after begin() to a full flash, so a partial update
@@ -199,7 +214,10 @@ class Uc8179Driver : public PanelDriver {
   // one bus for the lifetime of the driver.
   EpdBus* _bus = nullptr;
   // A PON was commanded but not waited on, so the ~127 ms rail ramp overlaps the
-  // host's CPU-side page composition. Cleared by settlePrewarm().
+  // host's CPU-side page composition. Consumed by settlePrewarm(), which is
+  // what turns it into _isScreenOn. Also the double-issue guard for
+  // beginDisplayWork(): during this window _isScreenOn is still false, on
+  // purpose, because nothing has yet observed the rails come up.
   bool _ponPending = false;
 #endif
 #ifdef FREEINK_UC8179_LEAN_STREAMS
@@ -211,6 +229,16 @@ class Uc8179Driver : public PanelDriver {
   // frame lives in _grayBase. Any consumer that reads DTM1 as the OLD plane
   // flushes first; any write to DTM1 discharges the debt.
   bool _dtm1Stale = false;
+  // Which of transitionGrayscaleBase()'s two callers is on the stack, and thus
+  // whether an AA plane upload will overwrite DTM1 inside this same render —
+  // the entire justification for taking the _dtm1Stale debt at all. Set by
+  // displayGrayscaleBase() immediately before its call and consumed at the top
+  // of transitionGrayscaleBase(), so display()'s post-AA Fast reroute (the
+  // Home/menu transition, after which the render simply ends) always reads
+  // false and gets the eager stream. A member rather than a parameter so that
+  // builds without FREEINK_UC8179_LEAN_STREAMS are untouched: the flag and both
+  // of its uses sit inside #ifdefs and the signature does not move.
+  bool _aaUploadFollows = false;
 #endif
 #ifdef FREEINK_UC8179_DOUBLE_GRAY_PRE
   // One-shot: the next base transition runs the XTF_PRE_BW_MID corrective a

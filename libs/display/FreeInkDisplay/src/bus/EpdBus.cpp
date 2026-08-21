@@ -134,6 +134,7 @@ void EpdBus::cmd(uint8_t c) {
   SPI.transfer(c);
   digitalWrite(_pins.cs, HIGH);
   SPI.endTransaction();
+  noteWrite(true);
 }
 
 void EpdBus::data(uint8_t d) {
@@ -143,6 +144,7 @@ void EpdBus::data(uint8_t d) {
   SPI.transfer(d);
   digitalWrite(_pins.cs, HIGH);
   SPI.endTransaction();
+  noteWrite(false);
 }
 
 void EpdBus::data(const uint8_t* d, uint16_t len) {
@@ -152,19 +154,22 @@ void EpdBus::data(const uint8_t* d, uint16_t len) {
   SPI.writeBytes(d, len);
   digitalWrite(_pins.cs, HIGH);
   SPI.endTransaction();
+  noteWrite(false);
 }
 
 void EpdBus::cmdData(uint8_t c, const uint8_t* d, uint16_t len) {
+  const bool bare = !(len > 0 && d != nullptr);
   SPI.beginTransaction(_spi);
   digitalWrite(_pins.cs, LOW);
   digitalWrite(_pins.dc, LOW);
   SPI.transfer(c);
-  if (len > 0 && d != nullptr) {
+  if (!bare) {
     digitalWrite(_pins.dc, HIGH);
     SPI.writeBytes(d, len);
   }
   digitalWrite(_pins.cs, HIGH);
   SPI.endTransaction();
+  noteWrite(bare);
 }
 
 void EpdBus::cmdData2(uint8_t c, uint8_t d0, uint8_t d1) {
@@ -189,21 +194,24 @@ void EpdBus::rawCmd(uint8_t c) {
   digitalWrite(_pins.dc, LOW);
   SPI.transfer(c);
   digitalWrite(_pins.dc, HIGH);
+  noteWrite(true);
 }
 
 void EpdBus::rawData(uint8_t d) {
   digitalWrite(_pins.dc, HIGH);
   SPI.transfer(d);
+  noteWrite(false);
 }
 
 void EpdBus::rawWriteBytes(const uint8_t* d, uint16_t len) {
   digitalWrite(_pins.dc, HIGH);
   SPI.writeBytes(d, len);
+  noteWrite(false);
 }
 
-void EpdBus::waitBusy(const char* tag) { waitBusy(_busy, tag); }
+bool EpdBus::waitBusy(const char* tag) { return waitBusy(_busy, tag); }
 
-void EpdBus::waitBusy(BusyPolarity p, const char* tag) {
+bool EpdBus::waitBusy(BusyPolarity p, const char* tag) {
   const unsigned long start = millis();
   // Both hooks engage lazily, only once the wait has proven long (see
   // setBusyWaitHooks). longWait gates the slice hook independently of the
@@ -211,9 +219,16 @@ void EpdBus::waitBusy(BusyPolarity p, const char* tag) {
   bool longWait = false;
   bool hookFired = false;
   bool x3SawLow = false;
+  // True once BUSY has actually been seen asserted; reported to the caller.
+  bool sawBusy = false;
+  // Consumed here, on the single entry to every wait, so no return path can
+  // leave it set for the next one. See the UcIdleHigh branch.
+  const bool expectAssertion = _lastWriteBareCmd;
+  _lastWriteBareCmd = false;
 
   if (p == BusyPolarity::ActiveHigh) {
     while (digitalRead(_pins.busy) == HIGH) {
+      sawBusy = true;
       busyIdle(longWait, HIGH, 1);
       if (!longWait && millis() - start > BUSY_WAIT_HOOK_THRESHOLD_MS) {
         longWait = true;
@@ -236,6 +251,7 @@ void EpdBus::waitBusy(BusyPolarity p, const char* tag) {
       }
     }
     if (busy) {
+      sawBusy = true;
       do {
         busyIdle(longWait, LOW, 10);
         if (!longWait && millis() - start > BUSY_WAIT_HOOK_THRESHOLD_MS) {
@@ -259,16 +275,53 @@ void EpdBus::waitBusy(BusyPolarity p, const char* tag) {
     // longest waveform this family runs (~2 s), so it can only be reached by a
     // stuck BUSY line, where returning beats hanging the render task forever.
     delay(1);
-    while (digitalRead(_pins.busy) == LOW) {
-      busyIdle(longWait, LOW, 1);
-      if (!longWait && millis() - start > BUSY_WAIT_HOOK_THRESHOLD_MS) {
-        longWait = true;
-        if (_busyWaitBeginHook != nullptr) {
-          hookFired = true;
-          _busyWaitBeginHook();
+    bool busy = digitalRead(_pins.busy) == LOW;
+    // ASSERTION GRACE. That delay(1) is a *tick* budget, not a wall-clock one:
+    // it can return in well under a millisecond, and with FreeRTOS tickless idle
+    // active (host light-sleeping between wakes) its real duration is not even
+    // bounded below by the tick period. A PON/POF/DRF wait could therefore
+    // sample BUSY_N before the controller pulled it down, conclude "idle", and
+    // let the caller issue the next command into a controller that was about to
+    // go busy — which the UC family silently discards, so a power-on never
+    // happens and the activation that follows runs on unpowered rails. Give the
+    // assertion the same bounded wall-clock grace the ActiveLow branch above
+    // gives its own, exiting the moment BUSY_N is seen LOW. No assertion inside
+    // the window means the controller really is idle (a no-op command, or one
+    // that completed faster than any sample) — proceed, as before.
+    //
+    // Plain delay(1) rather than busyIdle() here: the slice hook waits for the
+    // pin to LEAVE the busy level, and throughout the grace it sits at the idle
+    // level, so the hook has nothing to sleep on. The window is also far below
+    // the hook threshold.
+    //
+    // Only after a bare command opcode. Every UC command that raises BUSY_N
+    // (PON/POF/DRF) is a lone opcode, whereas a wait that follows plane or
+    // register DATA is an "is the controller idle yet" check with no new command
+    // behind it — the UC8179 driver makes five of those per anti-aliased page.
+    // Gracing those would burn the full window on every one of them for an
+    // assertion that is not coming.
+    if (!busy && expectAssertion) {
+      while (millis() - start < UC_BUSY_ASSERT_GRACE_MS) {
+        if (digitalRead(_pins.busy) == LOW) {
+          busy = true;
+          break;
         }
+        delay(1);
       }
-      if (millis() - start > 30000) break;
+    }
+    if (busy) {
+      sawBusy = true;
+      do {
+        busyIdle(longWait, LOW, 1);
+        if (!longWait && millis() - start > BUSY_WAIT_HOOK_THRESHOLD_MS) {
+          longWait = true;
+          if (_busyWaitBeginHook != nullptr) {
+            hookFired = true;
+            _busyWaitBeginHook();
+          }
+        }
+        if (millis() - start > 30000) break;
+      } while (digitalRead(_pins.busy) == LOW);
     }
   } else {  // X3TwoPhase: wait for the LOW edge, then wait back to HIGH
     while (digitalRead(_pins.busy) == HIGH) {
@@ -277,6 +330,7 @@ void EpdBus::waitBusy(BusyPolarity p, const char* tag) {
     }
     if (digitalRead(_pins.busy) == LOW) {
       x3SawLow = true;
+      sawBusy = true;
       while (digitalRead(_pins.busy) == LOW) {
         busyIdle(longWait, LOW, 1);
         if (!longWait && millis() - start > BUSY_WAIT_HOOK_THRESHOLD_MS) {
@@ -292,17 +346,21 @@ void EpdBus::waitBusy(BusyPolarity p, const char* tag) {
   }
 
   if (hookFired && _busyWaitEndHook != nullptr) _busyWaitEndHook();
-  if (p == BusyPolarity::X3TwoPhase && !x3SawLow) return;
+  if (p == BusyPolarity::X3TwoPhase && !x3SawLow) return sawBusy;
 
   if (tag && Serial) {
     Serial.printf("[%lu]   Wait complete: %s (%lu ms)\n", millis(), tag, millis() - start);
   }
+  return sawBusy;
 }
 
 void EpdBus::waitRefreshComplete(const char* tag) {
   // The X4 Pro UC production wait is level-based, not edge-qualified. Keep the
   // same one-tick/idle-HIGH rule for refresh completion so a missed assertion
   // edge can never make the caller write RAM while the waveform is still busy.
+  // The refresh-completion assertion grace this context needs is the one
+  // waitBusy() applies to the DRF opcode itself — a single implementation
+  // covering both entry points, so nothing extra belongs here.
   if (_busy == BusyPolarity::UcIdleHigh) {
     waitBusy(_busy, tag);
     return;
