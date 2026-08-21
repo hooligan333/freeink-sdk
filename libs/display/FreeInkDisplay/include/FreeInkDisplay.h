@@ -103,6 +103,10 @@ class FreeInkDisplay {
   // True only when the runtime-selected panel driver accepts SSD1677 factory
   // LUT plane encoding.
   bool supportsFactoryGrayscale() const;
+  // True when a Fast refresh issued right after a grayscale page fully re-drives
+  // the gray charge, so the host need not force a clean refresh afterwards.
+  // See PanelDriver::fastAfterGrayscaleSafe().
+  bool fastAfterGrayscaleSafe() const;
   // True when displayGrayscaleBase() defers the base activation so the gray
   // planes join it in one waveform (Paper Mono) - see PanelDriver.
   bool combinesGrayscaleBase() const;
