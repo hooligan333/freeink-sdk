@@ -362,6 +362,9 @@ void Uc8179Driver::streamPlane(EpdBus& bus, uint8_t ramCmd, const uint8_t* fb, b
 }
 
 void Uc8179Driver::streamPlaneXor(EpdBus& bus, uint8_t ramCmd, const uint8_t* lhs, const uint8_t* rhs) {
+#ifdef FREEINK_UC8179_LEAN_STREAMS
+  if (ramCmd == CMD_DTM1) _dtm1Stale = false;  // as in streamPlane(): a write discharges the debt
+#endif
   uint8_t row[128];
   const uint16_t wb = _wb <= sizeof(row) ? _wb : sizeof(row);
   bus.cmd(ramCmd);
@@ -453,6 +456,10 @@ bool Uc8179Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t* p
       streamPlane(bus, CMD_DTM1, fb, /*invert=*/true);
     } else {
       // Full/forced-first flash retains the known absolute-from-white behavior.
+      // This is the one DTM1 write in the driver that does not go through
+      // streamPlane(), so it does not clear _dtm1Stale itself — it does not have
+      // to: reaching this branch means `fast` was false, which is exactly the
+      // case the _dtm1Stale block at the top of this function already discharged.
       bus.fillPlane(CMD_DTM1, 0xFF, _tresH, _wb);
     }
   }
@@ -506,6 +513,9 @@ void Uc8179Driver::startBwRefresh(EpdBus& bus, bool fast) {
 }
 
 void Uc8179Driver::displayFinish(EpdBus& bus, const uint8_t* fb) {
+#ifdef FREEINK_UC8179_RAIL_POWEROFF
+  settlePrewarm(bus);
+#endif
   if (!_pendingRefresh) return;
   _pendingRefresh = false;
 
@@ -660,6 +670,9 @@ void Uc8179Driver::beginGrayscale(EpdBus& bus, const uint8_t* fb, GrayscaleMode 
 }
 
 void Uc8179Driver::copyGrayscaleLsb(EpdBus& bus, const uint8_t* lsb) {
+#ifdef FREEINK_UC8179_RAIL_POWEROFF
+  settlePrewarm(bus);
+#endif
   if (!lsb) return;
   if (_absoluteInput) {
     bus.waitBusy(" absolute plane");
@@ -693,6 +706,9 @@ void Uc8179Driver::copyGrayscaleLsb(EpdBus& bus, const uint8_t* lsb) {
 }
 
 void Uc8179Driver::copyGrayscaleMsb(EpdBus& bus, const uint8_t* msb) {
+#ifdef FREEINK_UC8179_RAIL_POWEROFF
+  settlePrewarm(bus);
+#endif
   if (!msb) return;
   if (_absoluteInput) {
     bus.waitBusy(" absolute plane");
@@ -723,6 +739,9 @@ void Uc8179Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, con
                                bool factoryMode) {
   // fb = the reader's current frame; used to re-seed the B/W baseline below.
   (void)lut;          // waveform comes from the built-in gray LUT set (kGrayLuts)
+#ifdef FREEINK_UC8179_RAIL_POWEROFF
+  settlePrewarm(bus);
+#endif
 
   // The base refresh must be fully complete before we upload LUTs / stream — the
   // controller drops LUT/DTM/DRF writes while BUSY.
@@ -812,7 +831,13 @@ void Uc8179Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, con
     // transitionGrayscaleBase() streams DTM2 before runGrayscalePrecondition()
     // (its only caller), which is also the whole sleep/screensaver route;
     // copyGrayscaleMsb() streams DTM2 for the next AA page; deepSleep() reads no
-    // plane at all; and cleanupGrayscaleBuffers()'s fallback rewrites both. The
+    // plane at all; and cleanupGrayscaleBuffers()'s fallback rewrites both.
+    // displayGrayCalibration() was audited and excluded rather than covered: it
+    // is PanelDriver's base implementation (this driver does not override it)
+    // and has no caller anywhere in the SDK or in CrossPoint, so it cannot
+    // observe the missing restore. Wiring it up later would mean feeding it
+    // planes through copyGrayscaleLsb/Msb first, which write DTM1 and DTM2
+    // themselves — so it would still never read a stale NEW plane. The
     // "stale gray selector" the comment above guards against therefore never
     // reaches a DRF. _bwPlanesSynced accordingly means the baseline is coherent
     // for whatever refresh comes next, which is what its one consumer
@@ -842,6 +867,9 @@ void Uc8179Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, con
 }
 
 void Uc8179Driver::cleanupGrayscaleBuffers(EpdBus& bus, const uint8_t* bw) {
+#ifdef FREEINK_UC8179_RAIL_POWEROFF
+  settlePrewarm(bus);
+#endif
   bus.waitBusy(" 8179_gray_cleanup");
 #ifdef FREEINK_UC8179_LEAN_STREAMS
   // Gray exit is a baseline consumer, and it drops _grayBase below — settle any
