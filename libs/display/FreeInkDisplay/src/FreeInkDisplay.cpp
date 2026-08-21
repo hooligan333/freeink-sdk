@@ -882,6 +882,17 @@ bool FreeInkDisplay::supportsStripGrayscale() const {
   return !_inverted && _driver && _driver->supportsStripGrayscale();
 }
 
+bool FreeInkDisplay::supportsFactoryGrayscale() const {
+  return !_inverted && _driver && _driver->supportsFactoryGrayscale();
+}
+
+bool FreeInkDisplay::fastAfterGrayscaleSafe() const {
+  // Inverted rendering no-ops the grayscale entry points, so no gray charge is
+  // ever laid down and the guarantee has nothing to apply to; report false so
+  // hosts keep whatever night-mode path they already had.
+  return !_inverted && _driver && _driver->fastAfterGrayscaleSafe();
+}
+
 bool FreeInkDisplay::combinesGrayscaleBase() const { return _driver && _driver->combinesGrayscaleBase(); }
 
 void FreeInkDisplay::cleanupGrayscaleBuffers(const uint8_t* bwBuffer) {

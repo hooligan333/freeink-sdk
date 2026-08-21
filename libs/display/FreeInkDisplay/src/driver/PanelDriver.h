@@ -101,6 +101,20 @@ class PanelDriver {
 
   // --- grayscale (dual-plane LSB/MSB) ---
   virtual bool supportsStripGrayscale() const { return false; }
+  // True when this controller accepts SSD1677 absolute selector planes with
+  // the factory-quality LUT. This is a runtime capability because one firmware
+  // image may include several drivers and select the controller during boot.
+  virtual bool supportsFactoryGrayscale() const { return false; }
+  // True when an ordinary Fast display() issued immediately after this driver's
+  // grayscale pass fully re-drives the panel, INCLUDING the intermediate charge
+  // the gray waveform left behind — i.e. the driver internally substitutes a
+  // gray-exit transition for the plain differential update. Hosts that would
+  // otherwise force a clean (flashing) refresh on the page following grayscale
+  // content can then keep their ordinary refresh cadence. The corrective is
+  // per-pixel and LUT-selected, so it is independent of how much of the frame
+  // carried gray (photo areas cost no more than anti-aliased text edges).
+  // Runtime capability: one firmware image may carry several drivers.
+  virtual bool fastAfterGrayscaleSafe() const { return false; }
   // True when displayGrayscaleBase() DEFERS the base activation so the gray
   // planes join it in a single waveform (Paper Mono). Hosts should then route the
   // grayscale base through displayGrayscaleBase() instead of display(): a
