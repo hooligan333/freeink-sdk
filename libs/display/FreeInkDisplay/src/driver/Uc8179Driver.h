@@ -155,7 +155,10 @@ class Uc8179Driver : public PanelDriver {
   //
   // BETWEEN THE TWO the host may rewrite its framebuffer — the panel scans
   // controller RAM, whose planes were both streamed inside start — but must
-  // issue no bus operation of its own. `base` is therefore the frame that was
+  // issue no bus operation of its own. The controller is NOT neutral in that
+  // window: it sits inside an open PTIN partial window (full-panel PTL) with
+  // PSR in REG/custom-LUT mode; only the finish half's PTOUT and idle-CDI
+  // restore neutrality. A future caller must not assume otherwise. `base` is therefore the frame that was
   // actually activated (the caller's `fb` on the blocking path, the driver's
   // own _grayBase snapshot on the async one); the finish half reads no host
   // framebuffer.
@@ -296,10 +299,12 @@ class Uc8179Driver : public PanelDriver {
   // Set by requestDeepGrayEqualize(), which the host calls just before the base
   // display of an image page.
   //
-  // Staleness is impossible by construction rather than by convention: the only
-  // two functions in this driver that activate a B/W base are
-  // transitionGrayscaleBase() and displayStart(), and BOTH clear the flag —
-  // the first by consuming it, the second by discarding it. display() picks
+  // Staleness is impossible by construction rather than by convention: the
+  // functions in this driver that activate a B/W base are
+  // transitionGrayscaleBase() (and, under FREEINK_UC8179_OVERLAP_BASE, its
+  // Start/Finish split — Start deliberately does NOT clear the flag; the
+  // paired Finish consumes it, and the pairing is enforced by
+  // _pendingGrayBase/_pendingRefresh) and displayStart(), which discards it. display() picks
   // exactly one of the two; displayGrayscaleBase() and displayWindow() route
   // through display(); and initController() clears it across begin()/wake. So
   // the flag is always answered by the first base activation after it is set,
