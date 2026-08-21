@@ -212,6 +212,15 @@ class PanelDriver {
     (void)bus;
     (void)bw;
   }
+#ifdef FREEINK_UC8179_DOUBLE_GRAY_PRE
+  // Ask the driver to spend extra panel time on the NEXT base transition making
+  // black depth uniform across the frame, so the previous page cannot ghost
+  // through this one's grays. One-shot and advisory: a driver with no such pass,
+  // or one whose next base activation cannot use it, simply ignores it. Hosts
+  // arm it only for content that shows the artifact (large gray areas — an image
+  // page), because the corrective is a second full activation.
+  virtual void requestDeepGrayEqualize() {}
+#endif
 
   // --- optional, controller-specific hooks (no-op by default) ---
   virtual void requestResync(uint8_t settlePasses) { (void)settlePasses; }
