@@ -164,6 +164,15 @@ void Uc8179Driver::initController(EpdBus& bus) {
 #ifdef FREEINK_UC8179_DOUBLE_GRAY_PRE
   _deepEqualizeNext = false;
 #endif
+#ifdef FREEINK_UC8179_OVERLAP_BASE
+  // begin()/wake resets the controller; no split transition can still be owed.
+  _pendingGrayBase = false;
+  _pendingGrayBaseTurnOff = false;
+  _grayBaseDrfInFlight = false;
+#ifdef FREEINK_UC8179_LEAN_STREAMS
+  _pendingGrayBaseAaUpload = false;
+#endif
+#endif
 }
 
 void Uc8179Driver::begin(EpdBus& bus) {
@@ -192,6 +201,119 @@ void Uc8179Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, 
   displayFinish(bus, fb);
 }
 
+#ifdef FREEINK_UC8179_OVERLAP_BASE
+// Blocking composition of the split halves: the identical sequence, with no
+// window in between. Every caller that is not the host's asynchronous base
+// entry (displayStart()'s post-AA Fast reroute) lands here.
+void Uc8179Driver::transitionGrayscaleBase(EpdBus& bus, const uint8_t* fb, bool turnOff) {
+  if (!transitionGrayscaleBaseStart(bus, fb, turnOff)) return;
+  transitionGrayscaleBaseFinish(bus, fb);
+}
+
+// Front half: through the DRF opcode, no completion wait. See the header for
+// the contract the caller has to honor across the gap.
+bool Uc8179Driver::transitionGrayscaleBaseStart(EpdBus& bus, const uint8_t* fb, bool turnOff) {
+#ifdef FREEINK_UC8179_LEAN_STREAMS
+  // Consumed unconditionally at entry — before every early return — exactly as
+  // the unsplit function did, and handed straight to the finish half, which is
+  // where the OLD-plane decision it governs now lives.
+  _pendingGrayBaseAaUpload = _aaUploadFollows;
+  _aaUploadFollows = false;
+#endif
+  if (!fb) return false;
+#ifdef FREEINK_UC8179_RAIL_POWEROFF
+  settlePrewarm(bus);
+#endif
+#ifdef FREEINK_UC8179_LEAN_STREAMS
+  // XTF_PRE_BW_MID drives DTM1 (previous base) against DTM2 (new base), so any
+  // deferred OLD-plane restore has to land before _grayBase is overwritten with
+  // this page's snapshot. Normally already discharged by the AA upload of the
+  // page that deferred it, so this costs nothing on the reading path.
+  flushPendingOldPlane(bus);
+#endif
+  _grayBaseValid = false;
+  _absoluteGrayPlanes = false;
+  // The snapshot is what makes the overlap possible: it is taken here, from the
+  // still-intact frame, and it — not the host's framebuffer — is what the
+  // finish half restores the OLD plane from once the host has rewritten that
+  // framebuffer with AA plane data.
+  if (_grayBase != nullptr) {
+    memcpy(_grayBase, fb, _bufferSize);
+    _grayBaseValid = true;
+  }
+
+  bus.waitBusy(" 8179_gray_base_ready");
+  // DTM1 retains the preceding page's clean B/W base; DTM2 receives the new
+  // base. XTF_PRE_BW_MID drives that real transition without the OTP GC flash.
+  // This is the last read of `fb` in the whole sequence.
+  streamPlane(bus, CMD_DTM2, fb);
+  _bwPlanesSynced = false;
+  _pendingGrayBaseTurnOff = turnOff;
+  _grayBaseDrfInFlight = runGrayscalePreconditionStart(bus);
+  return true;
+}
+
+// Back half: the completion wait plus every post-activation step. Reads no host
+// framebuffer — `base` is the frame the activation above actually drove.
+void Uc8179Driver::transitionGrayscaleBaseFinish(EpdBus& bus, const uint8_t* base) {
+  if (_grayBaseDrfInFlight) {
+    _grayBaseDrfInFlight = false;
+    runGrayscalePreconditionFinish(bus, " 8179_gray_pre_DRF");
+  }
+
+  // Keep the generic B/W baseline coherent in case no AA pass follows (Home or
+  // a menu). An AA upload may immediately overwrite these planes; its cached
+  // B/W snapshot above remains intact.
+#ifdef FREEINK_UC8179_LEAN_STREAMS
+  // ...and on the reading path an AA upload always does, which made this 60 KB
+  // stream (~26-30 ms at 20 MHz) dead work on every anti-aliased page. Owe it
+  // instead: _grayBase holds the frame, and the handful of consumers that read
+  // DTM1 as the OLD plane flush the debt before they need it. See the unsplit
+  // history in this file's LEAN_STREAMS commentary for why only the
+  // displayGrayscaleBase() caller is allowed to take the debt: display()'s
+  // post-AA Fast reroute and displayStart()'s asynchronous one both end the
+  // render right after, and the debt must not sit across an idle gap.
+  if (_grayBaseValid && _pendingGrayBaseAaUpload) {
+    _dtm1Stale = true;
+  } else {
+    streamPlane(bus, CMD_DTM1, base);  // no AA upload coming, or no snapshot to restore from
+  }
+  _pendingGrayBaseAaUpload = false;
+#else
+  streamPlane(bus, CMD_DTM1, base);
+#endif
+  _oldPlaneValid = true;
+  _bwPlanesSynced = true;
+  _redriveAfterGray = false;
+  _needFullClear = false;
+
+#ifdef FREEINK_UC8179_DOUBLE_GRAY_PRE
+  // The black-depth equalize (see the unsplit rationale below the #else) stays
+  // BLOCKING and stays here, inside the finish half: an image page gets
+  // start ‖ plane renders -> finish (including this second activation) ->
+  // uploads -> gray pass. Overlapping the second pass too would need a second
+  // host-side scratch plane and a two-stage wait for no further CPU to hide.
+  if (_deepEqualizeNext) {
+    _deepEqualizeNext = false;
+#ifdef FREEINK_UC8179_LEAN_STREAMS
+    // The equalizing pass is defined by DTM1 == DTM2, and lean streams may have
+    // just DEFERRED the DTM1 restore instead of performing it. flushPendingOldPlane()
+    // streams _grayBase, which is this page's base, so afterwards DTM1 and DTM2
+    // agree exactly as they do on the non-lean path.
+    flushPendingOldPlane(bus);
+#endif
+    runGrayscalePrecondition(bus, " 8179_gray_pre2_DRF");
+  }
+#endif
+
+  if (_pendingGrayBaseTurnOff && _isScreenOn) {
+    bus.cmd(CMD_POWER_OFF);
+    bus.waitBusy(" 8179_gray_base_POF");
+    _isScreenOn = false;
+  }
+  _pendingGrayBaseTurnOff = false;
+}
+#else  // !FREEINK_UC8179_OVERLAP_BASE
 void Uc8179Driver::transitionGrayscaleBase(EpdBus& bus, const uint8_t* fb, bool turnOff) {
 #ifdef FREEINK_UC8179_LEAN_STREAMS
   // Consumed unconditionally at entry — before every early return — so it can
@@ -309,6 +431,7 @@ void Uc8179Driver::transitionGrayscaleBase(EpdBus& bus, const uint8_t* fb, bool 
     _isScreenOn = false;
   }
 }
+#endif  // FREEINK_UC8179_OVERLAP_BASE
 
 void Uc8179Driver::displayGrayscaleBase(EpdBus& bus, const uint8_t* fb, RefreshMode fallback, bool turnOff) {
   if (!fb) return;
@@ -391,6 +514,29 @@ void Uc8179Driver::streamPlaneXor(EpdBus& bus, uint8_t ramCmd, const uint8_t* lh
 
 bool Uc8179Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) {
   (void)prev;
+#ifdef FREEINK_UC8179_OVERLAP_BASE
+  // The same post-AA Fast reroute display() applies, but taken through the
+  // host's ASYNCHRONOUS entry point: start stock's XTF_PRE_BW_MID transition and
+  // hand its ~666 ms waveform back to the caller, which spends it rendering the
+  // AA planes that were previously composed only after the waveform had already
+  // finished. displayFinish() completes it.
+  //
+  // Conditional on the PSRAM base snapshot existing, because the whole overlap
+  // rests on it: the finish half runs after the host has reused its framebuffer
+  // as plane scratch, so the OLD-plane restore has to come from _grayBase.
+  // Without that allocation the transition simply stays blocking, exactly as
+  // display() runs it, and the caller's pending-refresh state stays clear.
+  if (mode == RefreshMode::Fast && _redriveAfterGray && _grayRefreshedOnce && _oldPlaneValid && !_needFullClear) {
+    if (_grayBase != nullptr) {
+      if (!transitionGrayscaleBaseStart(bus, fb, turnOff)) return false;
+      _pendingGrayBase = true;
+      _pendingRefresh = true;
+      return true;
+    }
+    transitionGrayscaleBase(bus, fb, turnOff);
+    return false;
+  }
+#endif
 #ifdef FREEINK_UC8179_RAIL_POWEROFF
   // Unlike every other entry point here, this one writes controller RAM before
   // its first waitBusy — ride out a prewarm ramp before the plane stream below.
@@ -525,6 +671,18 @@ void Uc8179Driver::displayFinish(EpdBus& bus, const uint8_t* fb) {
 #endif
   if (!_pendingRefresh) return;
   _pendingRefresh = false;
+#ifdef FREEINK_UC8179_OVERLAP_BASE
+  if (_pendingGrayBase) {
+    _pendingGrayBase = false;
+    // `fb` is deliberately not forwarded: by now the host has rewritten its
+    // framebuffer with AA plane data. _grayBase holds the byte-exact base this
+    // transition drove, snapshotted before the start half returned, and is
+    // non-null by construction — displayStart() only takes the asynchronous
+    // branch when the allocation exists.
+    transitionGrayscaleBaseFinish(bus, _grayBase);
+    return;
+  }
+#endif
 
   bus.waitRefreshComplete(" 8179_DRF");
   if (_pendingPartial) bus.cmd(CMD_PARTIAL_OUT);  // PTOUT closes the partial window
@@ -536,7 +694,18 @@ void Uc8179Driver::displayFinish(EpdBus& bus, const uint8_t* fb) {
   // Sync the OLD plane (0x10) with the just-displayed frame so the NEXT partial
   // diffs against it (KW clears erased pixels -> no ghosting). This is the piece
   // that makes fast page turns clean.
+#ifdef FREEINK_UC8179_OVERLAP_BASE
+  // Prefer the snapshot the start half took over the caller's live framebuffer.
+  // A host overlapping an asynchronous refresh with whole-buffer AA plane
+  // rendering (the reader's non-tiled path uses the framebuffer itself as plane
+  // scratch) has overwritten `fb` by now, and the just-displayed frame — not
+  // the LSB/MSB mask that replaced it — is what the differential baseline has
+  // to hold. Byte-identical to `fb` on every blocking caller, where the
+  // snapshot is a memcpy of the same frame taken moments earlier.
+  streamPlane(bus, CMD_DTM1, _grayBaseValid ? _grayBase : fb);
+#else
   streamPlane(bus, CMD_DTM1, fb);
+#endif
   _oldPlaneValid = true;
   _bwPlanesSynced = true;
   _needFullClear = false;
@@ -578,10 +747,30 @@ void Uc8179Driver::deepSleep(EpdBus& bus) {
 // RAM; displayGray() then runs the custom-LUT grayscale waveform. CrossPoint's
 // masks are converted below to Factory.bin's absolute plane0/plane1 encoding;
 // the resulting (DTM1,DTM2) pair selects the WW/BW/WB/BB LUT per pixel.
+#ifdef FREEINK_UC8179_OVERLAP_BASE
+// The overlap build cuts this function in two at the DRF, so that the host can
+// use the waveform. Everything up to and including the DRF opcode is the body
+// below (renamed, and returning whether it issued one); the wait and the
+// post-activation teardown move to runGrayscalePreconditionFinish(). The
+// original blocking entry point survives as their composition, so the callers
+// that do not overlap (the equalize pass) are unchanged. Only the function
+// head, the guard clause's return and the tail differ between the two builds —
+// the register/LUT stream itself is shared, not duplicated.
 void Uc8179Driver::runGrayscalePrecondition(EpdBus& bus, const char* drfTag) {
+  if (runGrayscalePreconditionStart(bus)) runGrayscalePreconditionFinish(bus, drfTag);
+}
+
+bool Uc8179Driver::runGrayscalePreconditionStart(EpdBus& bus) {
+#else
+void Uc8179Driver::runGrayscalePrecondition(EpdBus& bus, const char* drfTag) {
+#endif
   // Factory.bin skips XTF_PRE_BW_MID for its first AA page. Callers must have
   // retained the previous B/W base in DTM1 and loaded the new base into DTM2.
+#ifdef FREEINK_UC8179_OVERLAP_BASE
+  if (!_oldPlaneValid || !_grayRefreshedOnce) return false;
+#else
   if (!_oldPlaneValid || !_grayRefreshedOnce) return;
+#endif
 
   bus.waitBusy(" 8179_gray_pre_ready");
   bus.cmd(CMD_PARTIAL_IN);
@@ -622,6 +811,25 @@ void Uc8179Driver::runGrayscalePrecondition(EpdBus& bus, const char* drfTag) {
     _isScreenOn = true;
   }
   bus.cmd(CMD_DISPLAY_REFRESH);
+#ifdef FREEINK_UC8179_OVERLAP_BASE
+  // Confirm the waveform actually started (BUSY_N dropped) before handing the
+  // window back, so the finish half only has the completion edge left to ride
+  // out — the same bounded poll displayStart() runs after its own DRF. The poll
+  // issues no bus write, so EpdBus's bare-command assertion grace (set by the
+  // DRF opcode above) survives the gap and still covers the finish half's
+  // waitBusy() even if the drop is missed here.
+  {
+    const int8_t busyPin = bus.pins().busy;
+    const unsigned long t0 = millis();
+    while (digitalRead(busyPin) == HIGH && millis() - t0 < 50) delay(1);
+  }
+  return true;
+}
+
+// Back half: ride out the activation and close the partial window. Touches no
+// RAM plane, so the host is free to have rewritten its framebuffer meanwhile.
+void Uc8179Driver::runGrayscalePreconditionFinish(EpdBus& bus, const char* drfTag) {
+#endif
   bus.waitBusy(drfTag);
   bus.cmd(CMD_PARTIAL_OUT);
   bus.cmd(CMD_VCOM_DATA_INTERVAL);

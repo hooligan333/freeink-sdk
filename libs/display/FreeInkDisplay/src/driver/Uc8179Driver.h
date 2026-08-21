@@ -74,6 +74,15 @@ class Uc8179Driver : public PanelDriver {
   bool displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) override;
   void displayFinish(EpdBus& bus, const uint8_t* fb) override;
   bool supportsAsyncDisplay() const override { return true; }
+#ifdef FREEINK_UC8179_OVERLAP_BASE
+  // Both deferred paths here restore the differential baseline from _grayBase,
+  // the PSRAM snapshot displayStart() takes of the frame it activates, and
+  // never from the caller's `fb` — so a host is free to reuse its framebuffer
+  // during the waveform. Conditional on that allocation having succeeded; with
+  // no snapshot displayFinish() falls back to reading `fb` and the relaxation
+  // would be a lie.
+  bool asyncRefreshKeepsOwnFrame() const override { return _grayBase != nullptr; }
+#endif
 
   void requestResync(uint8_t settlePasses) override;
   void skipInitialResync() override;
@@ -138,6 +147,30 @@ class Uc8179Driver : public PanelDriver {
   // display() routes its post-AA Fast base here as well. Those two callers are
   // not interchangeable to the lean-stream path — see _aaUploadFollows.
   void transitionGrayscaleBase(EpdBus& bus, const uint8_t* fb, bool turnOff);
+#ifdef FREEINK_UC8179_OVERLAP_BASE
+  // The two halves transitionGrayscaleBase() is composed of, so the host can
+  // spend the 25-frame XTF_PRE_BW_MID waveform (~666 ms measured) rendering the
+  // AA planes instead of idling through it.
+  //
+  // Start does everything up to and including the activation's DRF opcode and
+  // returns without waiting for completion; it returns false only when there
+  // was nothing to start (null frame), in which case no finish is owed.
+  // Finish rides out the DRF and performs every post-activation step.
+  //
+  // BETWEEN THE TWO the host may rewrite its framebuffer — the panel scans
+  // controller RAM, whose planes were both streamed inside start — but must
+  // issue no bus operation of its own. `base` is therefore the frame that was
+  // actually activated (the caller's `fb` on the blocking path, the driver's
+  // own _grayBase snapshot on the async one); the finish half reads no host
+  // framebuffer.
+  bool transitionGrayscaleBaseStart(EpdBus& bus, const uint8_t* fb, bool turnOff);
+  void transitionGrayscaleBaseFinish(EpdBus& bus, const uint8_t* base);
+  // runGrayscalePrecondition() split the same way. Start returns true when a
+  // DRF was really issued — the pass self-skips before the first AA page — so
+  // only then is a completion wait owed.
+  bool runGrayscalePreconditionStart(EpdBus& bus);
+  void runGrayscalePreconditionFinish(EpdBus& bus, const char* drfTag);
+#endif
 #ifdef FREEINK_UC8179_RAIL_POWEROFF
   // Ride out a prewarm PON that beginDisplayWork() fired without waiting, and
   // only then declare the rails up. Every path that touches the controller
@@ -207,6 +240,27 @@ class Uc8179Driver : public PanelDriver {
   bool _pendingRefresh = false;
   bool _pendingTurnOff = false;
   bool _pendingPartial = false;  // this refresh used the PTIN/PTOUT partial path
+
+#ifdef FREEINK_UC8179_OVERLAP_BASE
+  // The pending refresh is an XTF_PRE_BW_MID base transition started by
+  // transitionGrayscaleBaseStart(), not an ordinary displayStart() activation,
+  // so displayFinish() must complete it through transitionGrayscaleBaseFinish()
+  // — a different post-activation pipeline (PTOUT, idle CDI, OLD-plane
+  // handling, the optional equalize pass) and a different frame source.
+  bool _pendingGrayBase = false;
+  // transitionGrayscaleBase()'s `turnOff` argument, carried across the split to
+  // the POF tail that consumes it.
+  bool _pendingGrayBaseTurnOff = false;
+  // runGrayscalePreconditionStart() actually issued a DRF, so the finish half
+  // owes it a completion wait. False when the pass self-skipped.
+  bool _grayBaseDrfInFlight = false;
+#ifdef FREEINK_UC8179_LEAN_STREAMS
+  // _aaUploadFollows as the start half read it, handed to the finish half where
+  // the OLD-plane decision it governs now lives. Consuming it in start keeps
+  // the member's "never carries into a later transition" invariant intact.
+  bool _pendingGrayBaseAaUpload = false;
+#endif
+#endif
 
 #ifdef FREEINK_UC8179_RAIL_POWEROFF
   // beginDisplayWork() has no bus parameter (PanelDriver's signature), so the

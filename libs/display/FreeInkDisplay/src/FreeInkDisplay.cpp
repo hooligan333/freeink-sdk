@@ -573,6 +573,15 @@ bool FreeInkDisplay::supportsAsyncRefresh() const {
   return !_inverted && !_inversionDirty && _driver != nullptr && _driver->supportsAsyncDisplay();
 }
 
+#ifdef FREEINK_UC8179_OVERLAP_BASE
+bool FreeInkDisplay::asyncRefreshKeepsOwnFrame() const {
+  // Deliberately ANDed with supportsAsyncRefresh(): the relaxation is only
+  // meaningful for a refresh that actually defers, and the inversion gates
+  // there send inverted output down the blocking path anyway.
+  return supportsAsyncRefresh() && _driver->asyncRefreshKeepsOwnFrame();
+}
+#endif
+
 bool FreeInkDisplay::refreshBusy() {
   // Does NOT clear the pending state on completion: the driver's post-waveform
   // work (X3 DTM1 sync) must run through displayFinish(). When this returns
