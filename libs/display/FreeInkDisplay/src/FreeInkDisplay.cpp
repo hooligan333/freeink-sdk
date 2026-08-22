@@ -174,6 +174,18 @@ void FreeInkDisplay::selectDriver() {
       _driver = &lgfxEpdDriver();
 #elif FREEINK_DRIVER_IT8951
       _driver = &it8951Driver();
+#elif FREEINK_DRIVER_UC8179
+      // Terminal fallback for builds that exclude the SSD1677 driver (UC8179-
+      // batch personal builds): without this, a probe that fails to promote
+      // the profile default (SSD1677) leaves _driver null and begin() derefs
+      // it unconditionally — a boot panic instead of a degraded display. A
+      // UC8179 driver on non-UC8179 glass renders garbage but keeps the app
+      // (and the app0 recovery path) alive. Loud print so a mismatched unit
+      // is diagnosable over serial.
+      if (Serial) {
+        Serial.printf("[EPD] WARNING: probe did not confirm UC81xx; SSD1677 driver not in this build — falling back to UC8179\n");
+      }
+      _driver = &uc8179Driver();
 #endif
       break;
   }
