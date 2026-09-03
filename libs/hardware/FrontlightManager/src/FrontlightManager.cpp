@@ -85,12 +85,23 @@ uint32_t physicalDuty(uint32_t logicalDuty, uint32_t full, bool activeHigh) {
 // sleep current), mark the
 // channels KEEP_ALIVE, and disable the GPIO sleep-isolation override on the
 // output pins (a documented gotcha: sleep entry reconfigures the pad and kills
-// the PWM even when the clock survives). RC_FAST at 10 kHz supports up to
-// 10-bit resolution (17.5 MHz / 10 kHz = 1750 >= 1024), so the board profiles'
-// full duty range — including setBrightnessLevel's level-1 minimum step — stays
-// expressible. Uses the IDF driver directly (fixed LEDC_TIMER_0 + the channel
-// ids below) because the Arduino helpers don't expose sleep_mode; safe here
-// because frontlight boards using this flag have no other LEDC consumer.
+// the PWM even when the clock survives). Uses the IDF driver directly (fixed
+// LEDC_TIMER_0 + the channel ids below) because the Arduino helpers don't
+// expose sleep_mode; safe here because frontlight boards using this flag have
+// no other LEDC consumer.
+//
+// RC_FAST is ~17.5 MHz, roughly a fifth of the 80 MHz APB the board profiles'
+// frequencies were recovered against, so it cannot carry every profile: the
+// LEDC divider is a Q8 value that must land ABOVE its 8-bit fractional floor
+// (255), which caps the timer at about src / 2^bits — ~17 kHz at 10-bit. Over
+// that, ledc_timer_config() fails outright, attachChannel() returns false, and
+// the pads are never muxed to the LEDC at all: a permanently dark frontlight,
+// not a degraded one. So step the frequency down until RC_FAST can carry it
+// instead of losing the light. The duty RESOLUTION is what must be preserved
+// (apply() and setBrightnessLevel()'s level-1 minimum step compute against
+// fl.pwmResolutionBits); the frequency is free to move this far above flicker.
+constexpr uint32_t LEDC_LS_MIN_FREQ_HZ = 2000;
+
 bool attachChannel(int8_t gpio, uint8_t ch, uint32_t freq, uint8_t bits) {
   ledc_timer_config_t timer = {};
   timer.speed_mode = LEDC_LOW_SPEED_MODE;
@@ -98,10 +109,24 @@ bool attachChannel(int8_t gpio, uint8_t ch, uint32_t freq, uint8_t bits) {
   timer.timer_num = LEDC_TIMER_0;
   timer.freq_hz = freq;
   timer.clk_cfg = LEDC_USE_RC_FAST_CLK;
-  if (ledc_timer_config(&timer) != ESP_OK) {
-    // freq/bits exceed RC_FAST — leave the light unconfigured rather than
-    // silently falling back to a clock that freezes in light sleep.
+  esp_err_t err = ledc_timer_config(&timer);
+  while (err != ESP_OK && timer.freq_hz / 2 >= LEDC_LS_MIN_FREQ_HZ) {
+    timer.freq_hz /= 2;
+    err = ledc_timer_config(&timer);
+  }
+  if (err != ESP_OK) {
+    // Not even the floor is reachable at this resolution — leave the light
+    // unconfigured rather than silently falling back to a clock that freezes
+    // in light sleep.
+    LOG_ERR("FrontlightMgr", "LEDC LS attach failed: gpio=%d %uHz/%ubit unreachable on RC_FAST", gpio,
+            static_cast<unsigned>(freq), bits);
     return false;
+  }
+  if (timer.freq_hz != freq) {
+    // Logged at ERR so it stays visible on release images: a profile whose
+    // frequency RC_FAST cannot carry is a build/board mismatch worth seeing.
+    LOG_ERR("FrontlightMgr", "LEDC LS: %uHz/%ubit exceeds RC_FAST, clocking at %uHz", static_cast<unsigned>(freq), bits,
+            static_cast<unsigned>(timer.freq_hz));
   }
   ledc_channel_config_t chan = {};
   chan.gpio_num = gpio;
