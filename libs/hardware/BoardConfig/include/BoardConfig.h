@@ -153,12 +153,12 @@
 #else
 #define FREEINK_DRIVER_UC8179 0
 #endif
+// The UC8279 X4-family driver ships wherever UC8179 does (the same X4-family
+// panel batches), so it aliases UC8179's derivation above rather than repeating
+// its device list -- a second copy could silently go stale when a device is
+// added there. Still overridable with -DFREEINK_DRIVER_UC8279_X4=0/1.
 #ifndef FREEINK_DRIVER_UC8279_X4
-#if FREEINK_DEVICE_X4 || FREEINK_DEVICE_X4PRO || FREEINK_DEVICE_X4CLASSIC
-#define FREEINK_DRIVER_UC8279_X4 1
-#else
-#define FREEINK_DRIVER_UC8279_X4 0
-#endif
+#define FREEINK_DRIVER_UC8279_X4 FREEINK_DRIVER_UC8179
 #endif
 // M5 PaperColor has two interchangeable display backends: the fast hand-rolled
 // ED2208 driver (default), or M5's official M5GFX/M5Unified path (opt in with
