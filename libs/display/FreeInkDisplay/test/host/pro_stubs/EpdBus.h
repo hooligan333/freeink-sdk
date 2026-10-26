@@ -1,9 +1,12 @@
 #pragma once
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <vector>
 namespace freeink {
 enum class BusyPolarity { ActiveHigh, ActiveLow, X3TwoPhase, UcIdleHigh, ActiveLowReady };
+inline unsigned hostNotedLostActivations = 0;
+inline void noteLostActivation() { ++hostNotedLostActivations; }
 struct EpdPins { int8_t sclk, mosi, cs, dc, rst, busy, powerEnable=-1; };
 class EpdBus {
  public:
@@ -39,7 +42,10 @@ class EpdBus {
   bool transaction=false;
   unsigned waits=0;
   std::vector<size_t> busyWaitWriteCounts;
-  void clear() { assert(!transaction); writes.clear(); waits=0; busyWaitWriteCounts.clear(); }
+  // 1-based wait numbers (counted since clear(), refresh waits included) whose
+  // waitBusy() reports BUSY never asserted — a lost PON/DRF.
+  std::vector<unsigned> failWaits;
+  void clear() { assert(!transaction); writes.clear(); waits=0; busyWaitWriteCounts.clear(); failWaits.clear(); }
   void begin(const EpdPins&, uint32_t, BusyPolarity, int8_t=-1, int8_t=-1) {}
   void cmd(uint8_t c) { assert(!transaction); writes.push_back({c,{}}); }
   void data(uint8_t b) { data(&b,1); }
@@ -57,8 +63,13 @@ class EpdBus {
   // Mirrors the real EpdBus: waitBusy() reports whether BUSY was ever observed
   // asserted, so a caller can tell a real wait from a fall-through. Stubbed true
   // (the normal-hardware case) — the assertion-grace branches that consume it
-  // are the ones under test here.
-  bool waitBusy(const char* =nullptr) { assert(!transaction); ++waits; busyWaitWriteCounts.push_back(writes.size()); return true; }
+  // are the ones under test here — except the waits listed in failWaits.
+  bool waitBusy(const char* =nullptr) {
+    assert(!transaction);
+    ++waits;
+    busyWaitWriteCounts.push_back(writes.size());
+    return std::find(failWaits.begin(), failWaits.end(), waits) == failWaits.end();
+  }
   void waitRefreshComplete(const char* =nullptr) { assert(!transaction); ++waits; }
   bool isBusy() const { return false; }
   EpdPins pins() const { return {}; }
