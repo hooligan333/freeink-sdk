@@ -25,13 +25,36 @@ with tempfile.TemporaryDirectory(prefix="freeink-pro-test-") as directory:
     for name in ("Arduino.h", "BoardConfig.h", "SPI.h", "esp_heap_caps.h", "sdkconfig.h"):
         shutil.copy2(HERE / "pro_stubs" / name, root / name)
     shutil.copy2(HERE / "pro_stubs/EpdBus.h", root / "src/bus/EpdBus.h")
-    for single in (False, True):
-        exe = root / ("single" if single else "dual")
+    # A settable BUSY level (default LOW = asserted, as before) and a Serial that
+    # counts the UC8179 lost-activation diagnostic. Patched in here rather than
+    # in pro_stubs/Arduino.h, which run_picco.py edits by exact line.
+    arduino = (root / "Arduino.h").read_text().replace(
+        "inline int digitalRead(int) { return 0; }\n",
+        "inline int hostBusyLevel = 0;\ninline int digitalRead(int) { return hostBusyLevel; }\n")
+    arduino += """inline unsigned hostLostActivations = 0;
+struct HostSerial {
+  explicit operator bool() const { return true; }
+  template <class... A> void printf(const char* f, A... a) {
+    if (std::strstr(f, "ACTIVATION LOST")) ++hostLostActivations;
+    std::printf(f, a...);
+  }
+};
+inline HostSerial Serial;
+"""
+    (root / "Arduino.h").write_text(arduino)
+    # The combo firmware builds the UC8179 with all three of its feature flags;
+    # every other env builds it with none. Cover both.
+    uc8179Flags = ["-DFREEINK_UC8179_RAIL_POWEROFF", "-DFREEINK_UC8179_LEAN_STREAMS",
+                   "-DFREEINK_UC8179_DOUBLE_GRAY_PRE"]
+    for single, flagged in ((False, False), (True, False), (False, True), (True, True)):
+        exe = root / (("single" if single else "dual") + ("-uc8179-flags" if flagged else ""))
         command = [os.environ.get("CXX", "c++"), "-std=c++17", "-Wall", "-Wextra",
                    "-Wno-unused-parameter", "-Wno-unused-function", "-DBOARD_HAS_PSRAM=1",
                    "-DARDUINO=1", "-DFREEINK_DEVICE_METALIO_EINK4=1", "-I"+str(root), "-I"+str(root / "include")]
         if single:
             command += ["-DEINK_DISPLAY_SINGLE_BUFFER_MODE=1"]
+        if flagged:
+            command += uc8179Flags
         command += [str(HERE / "test_pro.cpp"), str(root / "src/FreeInkDisplay.cpp")]
         command += [str(root / f"src/driver/{name}Driver.cpp") for name in drivers]
         subprocess.run(command + ["-o", str(exe)], check=True)

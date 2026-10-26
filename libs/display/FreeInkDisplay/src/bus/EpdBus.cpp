@@ -2,6 +2,8 @@
 
 #include <BoardConfig.h>
 #include <driver/gpio.h>
+
+#include <atomic>
 #if defined(ARDUINO) && defined(CONFIG_PM_ENABLE) && CONFIG_PM_ENABLE
 #include <esp_pm.h>
 #endif
@@ -72,6 +74,15 @@ namespace freeink {
 // a time, so a single instance is safe. DRAM_ATTR keeps it out of flash for the
 // IRAM_ATTR ISR. Ported from the CrossPoint community-sdk EInkDisplay.
 static DRAM_ATTR SemaphoreHandle_t s_epdRefreshDone = nullptr;
+
+// Diagnostic counters (see EpdBus.h). Relaxed atomics: render task bumps,
+// host loop task drains.
+static std::atomic<uint32_t> s_lostActivations{0};
+static std::atomic<uint32_t> s_busyGlitches{0};
+
+void noteLostActivation() { s_lostActivations.fetch_add(1, std::memory_order_relaxed); }
+uint32_t takeLostActivationCount() { return s_lostActivations.exchange(0, std::memory_order_relaxed); }
+uint32_t takeBusyGlitchCount() { return s_busyGlitches.exchange(0, std::memory_order_relaxed); }
 
 static void IRAM_ATTR epdBusyIsr() {
   if (!s_epdRefreshDone) return;
@@ -312,6 +323,8 @@ bool EpdBus::waitBusy(BusyPolarity p, const char* tag) {
   bool x3SawLow = false;
   // True once BUSY has actually been seen asserted; reported to the caller.
   bool sawBusy = false;
+  // UcIdleHigh release samples rejected as glitches (see busyReleaseHolds()).
+  unsigned glitches = 0;
   // Consumed here, on the single entry to every wait, so no return path can
   // leave it set for the next one. See the UcIdleHigh branch.
   const bool expectAssertion = _lastWriteBareCmd;
@@ -412,7 +425,12 @@ bool EpdBus::waitBusy(BusyPolarity p, const char* tag) {
           }
         }
         if (millis() - start > 30000) break;
-      } while (digitalRead(_pins.busy) == LOW);
+        // RELEASE DEBOUNCE. One stray HIGH sample used to end this wait in the
+        // middle of a waveform, after which the caller's next RAM write (the
+        // DTM1 baseline sync) was silently discarded by the still-busy
+        // controller. Only a release that holds across the confirmation
+        // samples ends the wait; a glitch just resumes it.
+      } while (digitalRead(_pins.busy) == LOW || !busyReleaseHolds(glitches));
     }
   } else {  // X3TwoPhase: wait for the LOW edge, then wait back to HIGH
     while (digitalRead(_pins.busy) == HIGH) {
@@ -437,12 +455,27 @@ bool EpdBus::waitBusy(BusyPolarity p, const char* tag) {
   }
 
   if (hookFired && _busyWaitEndHook != nullptr) _busyWaitEndHook();
+  if (glitches) s_busyGlitches.fetch_add(glitches, std::memory_order_relaxed);
   if (p == BusyPolarity::X3TwoPhase && !x3SawLow) return sawBusy;
 
   if (tag && Serial) {
+    // Field diagnostic for the release debounce; silent on a clean wait.
+    if (glitches) Serial.printf("[%lu]   BUSY release glitch rejected x%u: %s\n", millis(), glitches, tag);
     Serial.printf("[%lu]   Wait complete: %s (%lu ms)\n", millis(), tag, millis() - start);
   }
   return sawBusy;
+}
+
+bool EpdBus::busyReleaseHolds(unsigned& glitches) {
+  // The caller has just read the idle level once; that read is sample one.
+  for (uint8_t i = 1; i < UC_BUSY_RELEASE_SAMPLES; ++i) {
+    delayMicroseconds(UC_BUSY_RELEASE_SAMPLE_GAP_US);
+    if (digitalRead(_pins.busy) == LOW) {
+      ++glitches;
+      return false;
+    }
+  }
+  return true;
 }
 
 void EpdBus::waitRefreshComplete(const char* tag) {

@@ -85,12 +85,16 @@ python3 libs/display/FreeInkDisplay/test/host/run_uc8279.py
 python3 libs/display/FreeInkDisplay/test/host/run_uc8279c_a4.py
 python3 libs/display/FreeInkDisplay/test/host/run_uc8253_power.py
 python3 libs/display/FreeInkDisplay/test/host/run_picco.py
+python3 libs/display/FreeInkDisplay/test/host/run_epdbus.py
 ```
 
 These compile production drivers against recording buses. The Pro suite also
-compiles the facade in single- and dual-buffer modes. The Picco suite builds the
+compiles the facade in single- and dual-buffer modes, each again with the
+UC8179 feature flags the X4 Pro combo build enables. The Picco suite builds the
 SSD1677/SSD2677 drivers as a Picco and as a Sticky, including each board's
-bit-banged panel probe. The checks cover transfer
+bit-banged panel probe. `run_epdbus.py` compiles the real `EpdBus` against a
+simulated clock and a scripted BUSY pin, covering the UC busy-wait's assertion
+grace, release debounce and runaway backstop. The checks cover transfer
 sequences, grayscale uploads, refresh lifecycle, and power-state behavior for
 the drivers included in each harness.
 

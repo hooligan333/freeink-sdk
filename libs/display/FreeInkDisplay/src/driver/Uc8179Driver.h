@@ -138,7 +138,19 @@ class Uc8179Driver : public PanelDriver {
 
  private:
   void initController(EpdBus& bus);
+  // Fires the B/W activation and records its outcome in _pendingPowered /
+  // _pendingStarted for activationLanded().
   void startBwRefresh(EpdBus& bus, bool fast);
+  // PON unless the rails are already up, re-issuing once if no BUSY_N ramp is
+  // observed. Returns false — and leaves _isScreenOn false — when neither
+  // attempt was seen to run.
+  bool powerOn(EpdBus& bus, const char* tag);
+  // Gate for an activation's baseline bookkeeping. `powered` = its PON was
+  // observed (or not needed); `started` = its DRF was seen to assert BUSY_N.
+  // When either is false the glass may not show the frame: log, drop the
+  // differential baseline so the next refresh is a full clear, park rails
+  // whose state is unknown, and return false — callers then skip their commit.
+  bool activationLanded(EpdBus& bus, bool powered, bool started, const char* site);
   void configureDirectGrayscale(EpdBus &bus);
   void restoreBwConfiguration(EpdBus &bus);
   // Stream a framebuffer into a RAM plane (ramCmd): reverse row order, use PSR
@@ -152,8 +164,9 @@ class Uc8179Driver : public PanelDriver {
   // DTM1 and the new base in DTM2. It replaces the ordinary B/W activation and
   // leaves analog power on for the AA pass that follows. `drfTag` names the
   // activation in the serial busy-wait timing print, so a repeated pass can be
-  // measured separately.
-  void runGrayscalePrecondition(EpdBus& bus, const char* drfTag = " 8179_gray_pre_DRF");
+  // measured separately. Returns activationLanded()'s verdict (true when the
+  // pass is skipped as Factory.bin's first-AA-page exception).
+  bool runGrayscalePrecondition(EpdBus& bus, const char* drfTag = " 8179_gray_pre_DRF");
   // Blocking, non-flashing B/W transition used by a Fast page immediately
   // after AA. The generic reader path does not call displayGrayscaleBase(), so
   // display() routes its post-AA Fast base here as well. Those two callers are
@@ -232,6 +245,8 @@ class Uc8179Driver : public PanelDriver {
   bool _pendingRefresh = false;
   bool _pendingTurnOff = false;
   bool _pendingPartial = false;  // this refresh used the PTIN/PTOUT partial path
+  bool _pendingPowered = false;  // its PON was observed, or the rails were already up
+  bool _pendingStarted = false;  // its DRF was seen to assert BUSY_N
 
 #ifdef FREEINK_UC8179_RAIL_POWEROFF
   // beginDisplayWork() has no bus parameter (PanelDriver's signature), so the

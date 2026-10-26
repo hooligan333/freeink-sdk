@@ -289,7 +289,21 @@ void Uc8179Driver::transitionGrayscaleBase(EpdBus& bus, const uint8_t* fb, bool 
   // base. XTF_PRE_BW_MID drives that real transition without the OTP GC flash.
   streamPlane(bus, CMD_DTM2, fb);
   _bwPlanesSynced = false;
-  runGrayscalePrecondition(bus);
+  if (!runGrayscalePrecondition(bus)) {
+    // The transition may never have reached the glass: commit nothing (no DTM1
+    // restore, no debt). activationLanded() already forced the next refresh to
+    // a full clear, which also makes any equalize hint moot.
+#ifdef FREEINK_UC8179_DOUBLE_GRAY_PRE
+    _deepEqualizeNext = false;
+#endif
+    _redriveAfterGray = false;
+    if (turnOff && _isScreenOn) {
+      bus.cmd(CMD_POWER_OFF);
+      bus.waitBusy(" 8179_gray_base_POF");
+      _isScreenOn = false;
+    }
+    return;
+  }
 
   // Keep the generic B/W baseline coherent in case no AA pass follows (Home or
   // a menu). An AA upload may immediately overwrite these planes; its cached
@@ -366,6 +380,9 @@ void Uc8179Driver::transitionGrayscaleBase(EpdBus& bus, const uint8_t* fb, bool 
     // the pages that asked for it.
     flushPendingOldPlane(bus);
 #endif
+    // A lost equalize pass should still leave the committed base on the glass,
+    // but its activationLanded() verdict drops the baseline anyway: the rule is
+    // uniform, and being wrong here costs one full refresh, not a ghost chain.
     runGrayscalePrecondition(bus, " 8179_gray_pre2_DRF");
   }
 #endif
@@ -528,6 +545,9 @@ bool Uc8179Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t* p
     startBwRefresh(bus, true);
     bus.waitRefreshComplete(" 8179_BW_TARGET_DRF");
     bus.cmd(CMD_PARTIAL_OUT);
+    // Never a baseline commit (the direct-gray page set _needFullClear, so the
+    // frame below is a full flash), but a loss is still logged and rails re-parked.
+    activationLanded(bus, _pendingPowered, _pendingStarted, " 8179_BW_TARGET_DRF");
   }
 
   // NEW plane (0x13) = new frame.
@@ -578,21 +598,70 @@ void Uc8179Driver::startBwRefresh(EpdBus& bus, bool fast) {
     bus.data(_cfg.gateScan);  // 0xE1 <- 0x02
   }
 
-  if (!_isScreenOn) {
-    bus.cmd(CMD_POWER_ON);
-    bus.waitBusy(" 8179_PON");
-    _isScreenOn = true;
-  }
+  _pendingPowered = powerOn(bus, " 8179_PON");
 
   if (fast) bus.cmd(CMD_PARTIAL_IN);  // PTIN — whole-panel partial (no 0x90 window)
   bus.cmd(CMD_DISPLAY_REFRESH);
   // Confirm the waveform started (BUSY dropped) before returning, so
-  // displayFinish() only rides out the completion edge.
+  // displayFinish() only rides out the completion edge. This is also the only
+  // reliable evidence the DRF ran: by the time a deferred displayFinish() waits,
+  // a healthy waveform may already be over, so its wait proves nothing.
+  // (Accepted: a DRF slower than 50 ms to assert costs one spurious full refresh.)
   {
     const int8_t busyPin = bus.pins().busy;
     const unsigned long t0 = millis();
-    while (digitalRead(busyPin) == HIGH && millis() - t0 < 50) delay(1);
+    bool started = digitalRead(busyPin) != HIGH;
+    while (!started && millis() - t0 < 50) {
+      delay(1);
+      started = digitalRead(busyPin) != HIGH;
+    }
+    _pendingStarted = started;
   }
+}
+
+bool Uc8179Driver::powerOn(EpdBus& bus, const char* tag) {
+  if (_isScreenOn) return true;
+  bus.cmd(CMD_POWER_ON);
+  if (!bus.waitBusy(tag)) {
+    // Rails were down (_isScreenOn is an observation) and PON is a 127 ms ramp,
+    // so no BUSY_N inside the assertion grace means the opcode was dropped or
+    // never landed. Re-issue once, as settlePrewarm() does: PON is idempotent.
+    bus.cmd(CMD_POWER_ON);
+    if (!bus.waitBusy(" 8179_PON_retry")) return false;
+  }
+  _isScreenOn = true;
+  return true;
+}
+
+bool Uc8179Driver::activationLanded(EpdBus& bus, bool powered, bool started, const char* site) {
+  if (powered && started) return true;
+  noteLostActivation();  // unconditional: the field usually has no Serial attached
+  // The UC8179 keeps the differential baseline only in DTM1. Committing this
+  // frame there when the glass may never have shown it makes every later DU
+  // diff against a phantom page: pixels black on it and white afterwards read
+  // as unchanged-white and are never erased, so pages pile up until a scrub.
+  // So the frame is NOT committed, and the next refresh is a full clear (the
+  // same _needFullClear/_oldPlaneValid pair begin() and requestResync() use) —
+  // a false alarm therefore costs exactly one extra full refresh.
+  if (Serial) {
+    Serial.printf("[%lu] [EPD] 8179 ACTIVATION LOST at%s: PON %s, DRF %s; baseline dropped, next refresh full\n",
+                  millis(), site, powered ? "ok" : "unobserved", started ? "ok" : "unobserved");
+  }
+  _oldPlaneValid = false;
+  _bwPlanesSynced = false;
+  _needFullClear = true;
+  if (!powered) {
+    // Neither PON was seen, which is also what PON on rails that are somehow
+    // already up looks like. Park them so the next PON starts from a known-off
+    // state and is observable, instead of re-failing on every later page.
+    // This POF can only land in a live waveform if BUSY_N misread across every
+    // window before it (both PON graces, then the DRF wait); the old code would
+    // have streamed DTM1 into that same busy controller, so this is no worse.
+    bus.cmd(CMD_POWER_OFF);
+    bus.waitBusy(" 8179_lost_POF");
+    _isScreenOn = false;
+  }
+  return false;
 }
 
 void Uc8179Driver::displayFinish(EpdBus& bus, const uint8_t* fb) {
@@ -611,13 +680,15 @@ void Uc8179Driver::displayFinish(EpdBus& bus, const uint8_t* fb) {
 
   // Sync the OLD plane (0x10) with the just-displayed frame so the NEXT partial
   // diffs against it (KW clears erased pixels -> no ghosting). This is the piece
-  // that makes fast page turns clean.
-  streamPlane(bus, CMD_DTM1, fb);
-  _oldPlaneValid = true;
-  _bwPlanesSynced = true;
-  _needFullClear = false;
+  // that makes fast page turns clean. Only for a frame that demonstrably ran.
+  if (activationLanded(bus, _pendingPowered, _pendingStarted, " 8179_DRF")) {
+    streamPlane(bus, CMD_DTM1, fb);
+    _oldPlaneValid = true;
+    _bwPlanesSynced = true;
+    _needFullClear = false;
+  }
 
-  if (_pendingTurnOff) {
+  if (_pendingTurnOff && _isScreenOn) {  // activationLanded() may already have parked them
     bus.cmd(CMD_POWER_OFF);
     bus.waitBusy(" 8179_POF");
     _isScreenOn = false;
@@ -661,10 +732,10 @@ void Uc8179Driver::deepSleep(EpdBus& bus) {
 // RAM; displayGray() then runs the custom-LUT grayscale waveform. CrossPoint's
 // masks are converted below to Factory.bin's absolute plane0/plane1 encoding;
 // the resulting (DTM1,DTM2) pair selects the WW/BW/WB/BB LUT per pixel.
-void Uc8179Driver::runGrayscalePrecondition(EpdBus& bus, const char* drfTag) {
+bool Uc8179Driver::runGrayscalePrecondition(EpdBus& bus, const char* drfTag) {
   // Factory.bin skips XTF_PRE_BW_MID for its first AA page. Callers must have
   // retained the previous B/W base in DTM1 and loaded the new base into DTM2.
-  if (!_oldPlaneValid || !_grayRefreshedOnce) return;
+  if (!_oldPlaneValid || !_grayRefreshedOnce) return true;
 
   bus.waitBusy(" 8179_gray_pre_ready");
   bus.cmd(CMD_PARTIAL_IN);
@@ -699,17 +770,14 @@ void Uc8179Driver::runGrayscalePrecondition(EpdBus& bus, const char* drfTag) {
     bus.data(&l[1], GRAY_LUT_LEN);
   }
 
-  if (!_isScreenOn) {
-    bus.cmd(CMD_POWER_ON);
-    bus.waitBusy(" 8179_gray_pre_PON");
-    _isScreenOn = true;
-  }
+  const bool powered = powerOn(bus, " 8179_gray_pre_PON");
   bus.cmd(CMD_DISPLAY_REFRESH);
-  bus.waitBusy(drfTag);
+  const bool started = bus.waitBusy(drfTag);
   bus.cmd(CMD_PARTIAL_OUT);
   bus.cmd(CMD_VCOM_DATA_INTERVAL);
   bus.data(_cfg.cdiIdle);
   bus.data(CDI_INTERVAL);
+  return activationLanded(bus, powered, started, drfTag);
 }
 
 void Uc8179Driver::preconditionGrayscale(EpdBus& bus, uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
@@ -832,13 +900,12 @@ void Uc8179Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, con
     if (_directGrayPlanes != 3)
       return;
     bus.waitBusy(" 8179_direct_ready");
-    if (!_isScreenOn) {
-      bus.cmd(CMD_POWER_ON);
-      bus.waitBusy(" 8179_direct_PON");
-      _isScreenOn = true;
-    }
+    const bool powered = powerOn(bus, " 8179_direct_PON");
     bus.cmd(CMD_DISPLAY_REFRESH);
-    bus.waitBusy(" 8179_DIRECT_GRAY_DRF");
+    const bool started = bus.waitBusy(" 8179_DIRECT_GRAY_DRF");
+    // Commits no baseline either way (a full clear is already owed below); a
+    // loss is logged and its rails re-parked.
+    activationLanded(bus, powered, started, " 8179_DIRECT_GRAY_DRF");
     _directGrayOnPanel = true;
     _directGrayPass = false;
     _directGrayPlanes = 0;
@@ -846,7 +913,7 @@ void Uc8179Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, con
     _needFullClear = true;
     _oldPlaneValid = false;
     _redriveAfterGray = false;
-    if (turnOff) {
+    if (turnOff && _isScreenOn) {  // as in displayFinish()
       bus.cmd(CMD_POWER_OFF);
       bus.waitBusy(" 8179_direct_POF");
       _isScreenOn = false;
@@ -886,13 +953,9 @@ void Uc8179Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, con
     bus.data(PLL_40_HZ);
   }
 
-  if (!_isScreenOn) {
-    bus.cmd(CMD_POWER_ON);
-    bus.waitBusy(" 8179_gray_PON");
-    _isScreenOn = true;
-  }
+  const bool powered = powerOn(bus, " 8179_gray_PON");
   bus.cmd(CMD_DISPLAY_REFRESH);
-  bus.waitBusy(" 8179_gray_split_DRF");
+  const bool started = bus.waitBusy(" 8179_gray_split_DRF");
   if (slowerImageWaveform) {
     bus.cmd(CMD_PLL_CONTROL);
     bus.data(PLL_50_HZ);
@@ -902,7 +965,15 @@ void Uc8179Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, con
   // Its bookkeeping writes the clean B/W base to BOTH DTM1 and DTM2. Besides
   // preserving the next transition's old frame, this prevents a stale gray
   // selector plane from being reused by a later refresh (especially sleep).
-  if (_grayBaseValid) {
+  //
+  // Not when this activation was lost, and not when a full clear is already
+  // owed: that is how a lost base activation earlier in this page (displayFinish()
+  // or transitionGrayscaleBase(), which leave _grayBaseValid set for this pass)
+  // reaches here, and the _needFullClear = false below would launder it straight
+  // back into the differential baseline. Skipping is safe — that full clear
+  // rewrites both planes before anything reads them, and
+  // cleanupGrayscaleBuffers() sees _bwPlanesSynced false and restores them.
+  if (activationLanded(bus, powered, started, " 8179_gray_split_DRF") && !_needFullClear && _grayBaseValid) {
     streamPlane(bus, CMD_DTM1, _grayBase);
 #ifndef FREEINK_UC8179_LEAN_STREAMS
     streamPlane(bus, CMD_DTM2, _grayBase);

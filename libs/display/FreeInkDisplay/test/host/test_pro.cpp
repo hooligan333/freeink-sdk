@@ -612,6 +612,257 @@ static void testMetalio() {
   assert(lastRegister(bus, 0x10) == 0x03);
 }
 
+static size_t lastIndex(const EpdBus& bus, uint8_t command) {
+  for (size_t i = bus.writes.size(); i-- > 0;)
+    if (bus.writes[i].command == command) return i;
+  assert(false);
+  return 0;
+}
+
+static bool writtenAfter(const EpdBus& bus, uint8_t command, size_t index) {
+  for (size_t i = index + 1; i < bus.writes.size(); ++i)
+    if (bus.writes[i].command == command) return true;
+  return false;
+}
+
+static unsigned commandCount(const EpdBus& bus, uint8_t command) {
+  return unsigned(
+      std::count_if(bus.writes.begin(), bus.writes.end(), [command](const auto& w) { return w.command == command; }));
+}
+
+// A clearing (non-differential) B/W refresh: no PTIN, full-waveform TSSET, DTM1
+// seeded white before the DRF, then the frame committed after it.
+static void assertFullClear(const EpdBus& bus, const Uc8179Driver& d) {
+  const size_t drf = lastIndex(bus, 0x12);
+  assert(commandCount(bus, 0x91) == 0 && lastRegister(bus, 0xe5) == 0x1e);
+  const auto first =
+      std::find_if(bus.writes.begin(), bus.writes.end(), [](const auto& w) { return w.command == 0x10; });
+  assert(first != bus.writes.end() && size_t(first - bus.writes.begin()) < drf);
+  assert(std::all_of(first->bytes.begin(), first->bytes.end(), [](uint8_t v) { return v == 0xff; }));
+  assert(writtenAfter(bus, 0x10, drf));
+  assert(d._oldPlaneValid && !d._needFullClear);
+}
+
+// A PON or DRF whose BUSY_N never asserted must not be committed as the DTM1
+// differential baseline, and the next refresh must be a full clear.
+static void testUc8179LostActivation() {
+  const auto a = frame(5), b = frame(71), c = frame(123), lsb = frame(13), msb = frame(29);
+  Uc8179Driver d;
+  EpdBus bus;
+  d.begin(bus);
+  d.display(bus, a.data(), nullptr, RefreshMode::Full, false);
+  assert(d._oldPlaneValid && !d._needFullClear && d._isScreenOn);
+  hostLostActivations = 0;
+
+  // Lost DRF on a differential page: BUSY_N never drops inside the start poll.
+  bus.clear();
+  hostBusyLevel = HIGH;
+  d.display(bus, b.data(), nullptr, RefreshMode::Fast, false);
+  hostBusyLevel = 0;
+  assert(commandCount(bus, 0x91) == 1);                    // it was the DU partial
+  assert(!writtenAfter(bus, 0x10, lastIndex(bus, 0x12)));  // ...and was NOT committed
+  assert(!d._oldPlaneValid && d._needFullClear && !d._bwPlanesSynced);
+  assert(d._isScreenOn && commandCount(bus, 0x02) == 0);  // PON was fine: rails stay up
+  assert(hostLostActivations == 1);
+  // The next Fast request self-heals as a full clear, then DU resumes.
+  bus.clear();
+  d.display(bus, c.data(), nullptr, RefreshMode::Fast, false);
+  assertFullClear(bus, d);
+  bus.clear();
+  d.display(bus, a.data(), nullptr, RefreshMode::Fast, false);
+  assert(commandCount(bus, 0x91) == 1 && writtenAfter(bus, 0x10, lastIndex(bus, 0x12)));
+  assert(hostLostActivations == 1);
+
+  // PON lost, and its re-issue too: the frame still fires (never skipped), but
+  // is not committed, the rails are not claimed, and they are parked so the
+  // next PON starts from a known-off state.
+  d.display(bus, b.data(), nullptr, RefreshMode::Fast, true);  // POF: rails down
+  assert(!d._isScreenOn);
+  bus.clear();
+  bus.failWaits = {1, 2};  // 8179_PON, 8179_PON_retry
+  d.display(bus, c.data(), nullptr, RefreshMode::Fast, false);
+  const size_t drf = lastIndex(bus, 0x12);
+  assert(commandCount(bus, 0x04) == 2 && writtenAfter(bus, 0x02, drf));
+  assert(!writtenAfter(bus, 0x10, drf));
+  assert(!d._isScreenOn && !d._oldPlaneValid && d._needFullClear);
+  assert(hostLostActivations == 2);
+  bus.clear();
+  d.display(bus, a.data(), nullptr, RefreshMode::Fast, false);
+  assert(commandCount(bus, 0x04) == 1 && d._isScreenOn);
+  assertFullClear(bus, d);
+
+  // A PON whose re-issue is observed is a recovered frame, not a lost one.
+  d.display(bus, b.data(), nullptr, RefreshMode::Fast, true);
+  bus.clear();
+  bus.failWaits = {1};
+  d.display(bus, c.data(), nullptr, RefreshMode::Fast, false);
+  assert(commandCount(bus, 0x04) == 2 && commandCount(bus, 0x02) == 0);
+  assert(commandCount(bus, 0x91) == 1 && writtenAfter(bus, 0x10, lastIndex(bus, 0x12)));
+  assert(d._isScreenOn && d._oldPlaneValid && !d._needFullClear);
+  assert(hostLostActivations == 2);
+
+  // AA page, so the next base goes through the XTF_PRE_BW_MID transition.
+  const auto aaPage = [&](const Bytes& base) {
+    d.beginGrayscale(bus, base.data(), GrayscaleMode::Overlay, RefreshMode::Fast, false);
+    d.copyGrayscaleLsb(bus, lsb.data());
+    d.copyGrayscaleMsb(bus, msb.data());
+  };
+  aaPage(a);
+  d.displayGray(bus, msb.data(), false, nullptr, false);
+  assert(d._grayRefreshedOnce && d._redriveAfterGray && d._oldPlaneValid && !d._needFullClear);
+
+  // Lost gray pre-pass DRF (waits: gray_base_ready, gray_pre_ready, DRF).
+  bus.clear();
+  bus.failWaits = {3};
+#ifdef FREEINK_UC8179_DOUBLE_GRAY_PRE
+  d.requestDeepGrayEqualize();
+#endif
+  d.beginGrayscale(bus, b.data(), GrayscaleMode::Overlay, RefreshMode::Fast, false);
+  assert(commandCount(bus, 0x12) == 1);  // also: no equalize pass after a lost transition
+  assert(!writtenAfter(bus, 0x10, lastIndex(bus, 0x12)));
+  assert(!d._oldPlaneValid && d._needFullClear && hostLostActivations == 3);
+#ifdef FREEINK_UC8179_LEAN_STREAMS
+  assert(!d._dtm1Stale);
+#endif
+#ifdef FREEINK_UC8179_DOUBLE_GRAY_PRE
+  assert(!d._deepEqualizeNext);
+#endif
+  // The AA pass on top still renders, but must not launder the lost base back
+  // into the baseline through its own DTM1 restore.
+  d.copyGrayscaleLsb(bus, lsb.data());
+  d.copyGrayscaleMsb(bus, msb.data());
+  bus.clear();
+  d.displayGray(bus, msb.data(), false, nullptr, false);
+  assert(commandCount(bus, 0x12) == 1 && !writtenAfter(bus, 0x10, lastIndex(bus, 0x12)));
+  assert(!d._oldPlaneValid && d._needFullClear && hostLostActivations == 3);
+  d.cleanupGrayscaleBuffers(bus, msb.data());
+  assert(d._needFullClear);  // the plane restore does not cancel the owed clear
+  bus.clear();
+  aaPage(c);
+  assertFullClear(bus, d);
+  d.displayGray(bus, msb.data(), false, nullptr, false);
+
+  // Lost AA activation itself (waits: gray_ready, DRF).
+  aaPage(a);
+  bus.clear();
+  bus.failWaits = {2};
+  d.displayGray(bus, msb.data(), false, nullptr, false);
+  assert(!writtenAfter(bus, 0x10, lastIndex(bus, 0x12)));
+  assert(!d._oldPlaneValid && d._needFullClear && hostLostActivations == 4);
+  bus.clear();
+  d.display(bus, b.data(), nullptr, RefreshMode::Fast, false);  // no post-AA transition
+  assertFullClear(bus, d);
+
+  // Lost direct-gray DRF (waits: direct_ready, PON — rails went down with the
+  // direct setup's reset — then DRF). Nothing to commit there; the next B/W page
+  // still repaints through the BW_TARGET pre-pass and a full clear.
+  d.beginGrayscale(bus, a.data(), GrayscaleMode::Direct, RefreshMode::Fast, false);
+  d.copyGrayscaleLsb(bus, lsb.data());
+  d.copyGrayscaleMsb(bus, msb.data());
+  bus.clear();
+  bus.failWaits = {3};
+  d.displayGray(bus, msb.data(), false, nullptr, true);
+  assert(commandCount(bus, 0x12) == 1 && hostLostActivations == 5);
+  assert(d._directGrayOnPanel && d._needFullClear && !d._oldPlaneValid);
+  bus.clear();
+  d.display(bus, b.data(), nullptr, RefreshMode::Fast, false);
+  assert(commandCount(bus, 0x12) == 2 && commandCount(bus, 0x91) == 1);  // BW_TARGET is the only PTIN
+  assert(lastRegister(bus, 0xe5) == 0x1e && writtenAfter(bus, 0x10, lastIndex(bus, 0x12)));
+  assert(d._oldPlaneValid && !d._needFullClear && hostLostActivations == 5);
+
+  // Lost PON on a turnOff page: activationLanded() parks the rails, and the
+  // turnOff tail must not send a second POF.
+  d.display(bus, a.data(), nullptr, RefreshMode::Fast, true);
+  bus.clear();
+  bus.failWaits = {1, 2};
+  d.display(bus, b.data(), nullptr, RefreshMode::Fast, true);
+  assert(commandCount(bus, 0x02) == 1 && !d._isScreenOn && hostLostActivations == 6);
+  assert(hostNotedLostActivations == hostLostActivations);  // counter tracks the log line
+  free(d._grayBase);
+}
+
+static void aaPage(Uc8179Driver& d, EpdBus& bus, const Bytes& base) {
+  const auto lsb = frame(13), msb = frame(29);
+  d.beginGrayscale(bus, base.data(), GrayscaleMode::Overlay, RefreshMode::Fast, false);
+  d.copyGrayscaleLsb(bus, lsb.data());
+  d.copyGrayscaleMsb(bus, msb.data());
+  d.displayGray(bus, msb.data(), false, nullptr, false);
+}
+
+#ifdef FREEINK_UC8179_RAIL_POWEROFF
+// Healthy prewarm: the PON is fired from beginDisplayWork() and ridden out by
+// settlePrewarm(), so the display path issues none and the detector stays quiet —
+// including when composition outlasted the ramp and neither prewarm wait saw it.
+static void testUc8179HealthyPrewarm() {
+  const auto a = frame(5), b = frame(71);
+  const unsigned lost = hostLostActivations;
+  Uc8179Driver d;
+  EpdBus bus;
+  d.begin(bus);
+  d.display(bus, a.data(), nullptr, RefreshMode::Full, false);
+  for (bool rampSeen : {true, false}) {
+    d.controllerIdle(bus);
+    assert(!d._isScreenOn);
+    bus.clear();
+    d.beginDisplayWork();
+    assert(d._ponPending && !d._isScreenOn);
+    if (!rampSeen) bus.failWaits = {1, 2};  // 8179_prewarm_PON, 8179_prewarm_PON_retry
+    d.display(bus, b.data(), nullptr, RefreshMode::Fast, false);
+    assert(commandCount(bus, 0x04) == (rampSeen ? 1u : 2u) && commandCount(bus, 0x02) == 0);
+    assert(d._isScreenOn && commandCount(bus, 0x91) == 1 && writtenAfter(bus, 0x10, lastIndex(bus, 0x12)));
+    assert(d._oldPlaneValid && !d._needFullClear);
+  }
+  assert(hostLostActivations == lost);
+  free(d._grayBase);
+}
+#endif
+
+#ifdef FREEINK_UC8179_DOUBLE_GRAY_PRE
+static void testUc8179DeepEqualize() {
+  const auto a = frame(5), b = frame(71), c = frame(123), lsb = frame(13), msb = frame(29);
+  const unsigned lost = hostLostActivations;
+  Uc8179Driver d;
+  EpdBus bus;
+  d.begin(bus);
+  d.display(bus, a.data(), nullptr, RefreshMode::Full, false);
+  aaPage(d, bus, a);
+
+  // Healthy equalize: two pre-pass activations, baseline committed, quiet.
+  bus.clear();
+  d.requestDeepGrayEqualize();
+  d.beginGrayscale(bus, b.data(), GrayscaleMode::Overlay, RefreshMode::Fast, false);
+  assert(commandCount(bus, 0x12) == 2 && !d._deepEqualizeNext);
+  assert(d._oldPlaneValid && !d._needFullClear && hostLostActivations == lost);
+  d.copyGrayscaleLsb(bus, lsb.data());
+  d.copyGrayscaleMsb(bus, msb.data());
+  bus.clear();
+  d.displayGray(bus, msb.data(), false, nullptr, false);
+  assert(writtenAfter(bus, 0x10, lastIndex(bus, 0x12)) && !d._needFullClear);
+
+  // Lost SECOND pass. Waits: gray_base_ready, gray_pre_ready, DRF,
+  // [lean: old_plane_flush], gray_pre_ready, DRF.
+  bus.clear();
+#ifdef FREEINK_UC8179_LEAN_STREAMS
+  bus.failWaits = {6};
+#else
+  bus.failWaits = {5};
+#endif
+  d.requestDeepGrayEqualize();
+  d.beginGrayscale(bus, c.data(), GrayscaleMode::Overlay, RefreshMode::Fast, false);
+  assert(commandCount(bus, 0x12) == 2 && hostLostActivations == lost + 1);
+  assert(!d._oldPlaneValid && d._needFullClear);
+  d.copyGrayscaleLsb(bus, lsb.data());
+  d.copyGrayscaleMsb(bus, msb.data());
+  bus.clear();
+  d.displayGray(bus, msb.data(), false, nullptr, false);
+  assert(!writtenAfter(bus, 0x10, lastIndex(bus, 0x12)) && d._needFullClear);
+  bus.clear();
+  d.beginGrayscale(bus, a.data(), GrayscaleMode::Overlay, RefreshMode::Fast, false);
+  assertFullClear(bus, d);
+  free(d._grayBase);
+}
+#endif
+
 int main(int argc, char** argv) {
   if (argc > 1 && std::strcmp(argv[1], "metalio") == 0) {
     testMetalio();
@@ -639,5 +890,13 @@ int main(int argc, char** argv) {
   testSsd();
   testAsyncFrame<Uc8179Driver>();
   testAsyncFrame<Uc8279X4Driver>();
+  assert(hostLostActivations == 0);  // no healthy-path flow above trips the detector
+  testUc8179LostActivation();
+#ifdef FREEINK_UC8179_RAIL_POWEROFF
+  testUc8179HealthyPrewarm();
+#endif
+#ifdef FREEINK_UC8179_DOUBLE_GRAY_PRE
+  testUc8179DeepEqualize();
+#endif
   std::puts("Pro plane bytes, transaction counts, clean refreshes, power state and async frame ownership passed");
 }
