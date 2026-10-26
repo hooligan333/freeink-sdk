@@ -21,8 +21,18 @@ enum class BusyPolarity : uint8_t {
   ActiveHigh,  // SSD1677 (X4 / de-link): busy while HIGH
   ActiveLow,   // ED2208 (M5 PaperColor): busy while LOW
   X3TwoPhase,  // UC8253 (X3): wait for the LOW edge, then wait back to HIGH
-  UcIdleHigh,  // UC8179/UC8279 X4 Pro: tick + bounded assertion grace, then wait for BUSY_N HIGH
+  UcIdleHigh,  // UC8179/UC8279 X4 Pro: tick + bounded assertion grace, then wait for a debounced BUSY_N HIGH
 };
+
+// Field-diagnostic counters, free-running and unconditional (Serial is usually
+// detached in the field). Bumped from whichever task drives the panel; each
+// take*() returns the count since the previous take and resets it, so a host
+// can drain them into its own log. Lost activations: a UC8179 PON/DRF whose
+// BUSY_N was never seen (see Uc8179Driver::activationLanded()). Busy glitches:
+// UcIdleHigh release samples rejected by the debounce in waitBusy().
+void noteLostActivation();
+uint32_t takeLostActivationCount();
+uint32_t takeBusyGlitchCount();
 
 struct EpdPins {
   int8_t sclk;
@@ -222,6 +232,12 @@ class EpdBus {
   // Wall-clock window the UcIdleHigh wait allows a commanded BUSY_N assertion
   // before concluding the controller is idle. See waitBusy().
   static constexpr unsigned long UC_BUSY_ASSERT_GRACE_MS = 50;
+  // Consecutive idle-level samples, UC_BUSY_RELEASE_SAMPLE_GAP_US apart, that
+  // the UcIdleHigh wait needs before it accepts BUSY_N as released: 3 samples
+  // add 200 us to a genuine release (against 127-900 ms waits) and reject any
+  // shorter HIGH blip. See waitBusy().
+  static constexpr uint8_t UC_BUSY_RELEASE_SAMPLES = 3;
+  static constexpr unsigned UC_BUSY_RELEASE_SAMPLE_GAP_US = 100;
   void (*_busyWaitBeginHook)() = nullptr;
   void (*_busyWaitEndHook)() = nullptr;
   bool (*_busyWaitSliceHook)(int8_t busyPin, uint8_t busyLevel) = nullptr;
@@ -234,6 +250,11 @@ class EpdBus {
     }
     delay(fallbackDelayMs);
   }
+
+  // Confirm a UcIdleHigh BUSY_N release the caller has just sampled: true if
+  // the remaining UC_BUSY_RELEASE_SAMPLES all read idle, false (and ++glitches)
+  // at the first busy sample.
+  bool busyReleaseHolds(unsigned& glitches);
 
   void createPmLocks();
   [[nodiscard]] Transaction transaction();

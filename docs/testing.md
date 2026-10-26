@@ -69,12 +69,16 @@ python3 libs/display/FreeInkDisplay/test/host/run_pro.py
 python3 libs/display/FreeInkDisplay/test/host/run_uc8279.py
 python3 libs/display/FreeInkDisplay/test/host/run_uc8279c_a4.py
 python3 libs/display/FreeInkDisplay/test/host/run_uc8253_power.py
+python3 libs/display/FreeInkDisplay/test/host/run_epdbus.py
 ```
 
 These compile production drivers against recording buses. The Pro suite also
-compiles the facade in single- and dual-buffer modes. The checks cover transfer
-sequences, grayscale uploads, refresh lifecycle, and power-state behavior for
-the drivers included in each harness.
+compiles the facade in single- and dual-buffer modes, each again with the
+UC8179 feature flags the X4 Pro combo build enables. `run_epdbus.py` compiles
+the real `EpdBus` against a simulated clock and a scripted BUSY pin, covering
+the UC busy-wait's assertion grace, release debounce and runaway backstop.
+The checks cover transfer sequences, grayscale uploads, refresh lifecycle, and
+power-state behavior for the drivers included in each harness.
 
 For the board-profile and display-probe regression test, follow the
 [XteinkDetect host instructions](../libs/hardware/XteinkDetect/test/host/README.md).
