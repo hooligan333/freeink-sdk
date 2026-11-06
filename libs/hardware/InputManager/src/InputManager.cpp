@@ -3078,15 +3078,29 @@ void InputManager::pollGt911(const unsigned long now) {
   }
 
   if (!(status & 0x80)) {  // buffer not ready
-#if FREEINK_GT911_INT_WAKE
-    // A nonzero status with the buffer-ready bit clear is latched controller
-    // state (e.g. the HaveKey bit or a stale contact count) that 0x814E holds
-    // until the host clears it, and in low-level INT mode the line stays
-    // asserted along with it. Clear it here too so an armed level wake is not
-    // left firing on it. The all-zero idle pass stays a single read.
     if (status != 0) {
+      // A nonzero status with the buffer-ready bit clear is latched controller
+      // state (large-area detect, the HaveKey flag, a stale contact count)
+      // that 0x814E holds until the host clears it — and in low-level INT
+      // mode the controller holds the INT line asserted along with it. Leaving
+      // it set makes a level-wake host's idle gate (anyWakePinAsserted) stay
+      // true indefinitely, collapsing its tickless wait to the short slice
+      // poll until the next complete frame reaches the clear at the end of
+      // this function. The datasheet's clear-after-each-read rule covers this
+      // read too. The common all-zero idle pass stays read-only: writing zero
+      // over an already-zero register changes nothing, so skip the bus write.
+      //
+      // FORK DIVERGENCE from upstream PR #41: the PR runs this clear only with
+      // FREEINK_GT911_INT_WAKE. Here it stays unconditional (field-validated on
+      // the X4 Pro); the flag only swaps in the retrying, fault-latching clear.
+#if FREEINK_GT911_INT_WAKE
       gt911ClearStatusForWake();
-    } else {
+#else
+      gt911ClearStatus();
+#endif
+    }
+#if FREEINK_GT911_INT_WAKE
+    else {
       gt911SetStatusFault(false);  // nothing latched: INT is released
     }
 #endif
