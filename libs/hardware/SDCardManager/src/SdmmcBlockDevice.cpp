@@ -137,7 +137,10 @@ bool SdmmcBlockDevice::begin(const BoardConfig::SdmmcPins& pins) {
   // Clock backoff: a card/socket that cannot hold an elevated clock through this
   // wiring fails all four attempts identically — better a slow mount than no SD.
   // One extra attempt at the stock default clock, same power-cycle discipline.
-  if (mountErr != ESP_OK && host.max_freq_khz != SDMMC_FREQ_DEFAULT) {
+  // Only for boards whose profile PINS a clock (maxFreqKhz != 0): on unpinned
+  // boards (upstream's 40 MHz default) the power pulse below could drop a rail
+  // that feeds more than the card slot, and upstream has no backoff there.
+  if (mountErr != ESP_OK && pins.maxFreqKhz != 0 && host.max_freq_khz != SDMMC_FREQ_DEFAULT) {
     if (Serial) Serial.printf("[SDMMC] %d kHz mount failed; retrying at default clock\n", host.max_freq_khz);
     host.max_freq_khz = SDMMC_FREQ_DEFAULT;
     if (sdPwr >= 0) {
