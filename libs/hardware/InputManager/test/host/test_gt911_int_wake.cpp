@@ -276,6 +276,30 @@ void testFlagOffLeavesConfigAlone() {
   assert(Wire.statusReadAttempts == 1);
   Wire.busDead = false;
 }
+
+// FORK DIVERGENCE from upstream PR #41, which clears the buffer-not-ready
+// latched status only with the flag: the fork clears it unconditionally (a
+// single attempt, no retry), and the all-zero idle pass still costs no write.
+void testFlagOffNotReadyLatchedStatusIsCleared() {
+  Wire.loadFactory(1);
+  InputManager in;
+  boot(in);
+  Wire.report(0x01);
+  Wire.resetCounters();
+  poll(in);
+  assert(Wire.statusClearAttempts == 1 && Wire.statusClears == 1 && Wire.mem[WireStub::STATUS] == 0);
+  Wire.resetCounters();
+  poll(in);
+  assert(Wire.statusReadAttempts == 1 && Wire.statusClearAttempts == 0);
+  // A failed clear is one attempt and is not retried on the same poll.
+  Wire.report(0x01);
+  Wire.failStatusClears = 100;
+  Wire.resetCounters();
+  poll(in);
+  assert(Wire.statusClearAttempts == 1 && Wire.mem[WireStub::STATUS] == 0x01);
+  Wire.failStatusClears = 0;
+  assert(in.touchWakeIrqPin() == -1);
+}
 #endif
 }  // namespace
 
@@ -292,6 +316,7 @@ int main() {
   std::puts("GT911 INT wake (FREEINK_GT911_INT_WAKE=1) passed");
 #else
   testFlagOffLeavesConfigAlone();
+  testFlagOffNotReadyLatchedStatusIsCleared();
   std::puts("GT911 INT wake (FREEINK_GT911_INT_WAKE=0) passed");
 #endif
 }
