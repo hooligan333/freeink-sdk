@@ -1199,6 +1199,46 @@ static void testUc8179LostActivation() {
   free(d._grayBase);
 }
 
+// The one-pass text-AA path is outside the guard (OD-A (iii)): an unobserved
+// PON/DRF is counted for EPDLOST, once per activation, and nothing else changes
+// -- the frame is committed exactly as on a healthy page.
+static void testUc8179TextAaLostActivationIsLogOnly() {
+  Uc8179Driver d;
+  EpdBus bus;
+  d.begin(bus);
+  Bytes base(48000, 0xff), lsb(48000, 0), msb(48000, 0);
+  lsb[0] = 0x40;
+  msb[0] = 0x20;
+  d.display(bus, base.data(), nullptr, RefreshMode::Full, false);
+  d.setReaderRefresh(true);
+  const unsigned before = hostLostActivations;
+  // Each pair runs a turnOff page, then a page that has to issue the text
+  // path's own PON.
+  for (bool lose : {false, true, false}) {
+    for (bool off : {true, false}) {
+      d.beginGrayscale(bus, base.data(), GrayscaleMode::Overlay, RefreshMode::Fast, off);
+      for (unsigned y = 0; y < 480; y += 80) {
+        d.writeGrayscalePlaneStrip(bus, GrayPlane::Lsb, lsb.data() + y * 100, y, 80);
+        d.writeGrayscalePlaneStrip(bus, GrayPlane::Msb, msb.data() + y * 100, y, 80);
+      }
+      bus.clear();
+      if (lose) bus.failWaits = {1, 2, 3, 4};  // ready, PON (if issued), DRF, POF (if issued)
+      const unsigned noted = hostLostActivations;
+      d.displayGray(bus, base.data(), off, nullptr, false);
+      assert(hostLostActivations == noted + (lose ? 1u : 0u));  // one count per activation
+      // Committed regardless (option (iii) verbatim): no baseline drop, no forced full clear.
+      assert(d._textAa.onPanel() && !d._textAa.active() && !d._needFullClear);
+      assert(commandCount(bus, 0x12) == 1 && d._isScreenOn == !off);
+      bus.clear();
+      d.cleanupGrayscaleBuffers(bus, base.data());
+    }
+  }
+  assert(hostLostActivations == before + 2);
+  assert(hostNotedLostActivations == hostLostActivations);  // counter tracks the log line
+  d.setReaderRefresh(false);
+  free(d._grayBase);
+}
+
 static void aaPage(Uc8179Driver& d, EpdBus& bus, const Bytes& base) {
   const auto lsb = frame(13), msb = frame(29);
   d.beginGrayscale(bus, base.data(), GrayscaleMode::Overlay, RefreshMode::Fast, false);
@@ -1332,6 +1372,7 @@ int main(int argc, char** argv) {
 #endif
   assert(hostLostActivations == 0);  // no healthy-path flow above trips the detector
   testUc8179LostActivation();
+  testUc8179TextAaLostActivationIsLogOnly();
 #ifdef FREEINK_UC8179_RAIL_POWEROFF
   testUc8179HealthyPrewarm();
 #endif

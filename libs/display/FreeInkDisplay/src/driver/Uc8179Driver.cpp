@@ -972,9 +972,24 @@ void Uc8179Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, con
     bus.cmd(CMD_VCOM_DATA_INTERVAL);
     bus.data(0x29);
     bus.data(7);
-    if (!_isScreenOn) { bus.cmd(CMD_POWER_ON); bus.waitBusy("8179 text power"); _isScreenOn = true; }
+    // Fork: report an unobserved PON/DRF to the EPDLOST counter, log-only. This
+    // path is not under the lost-activation guard (owner decision OD-A (iii)):
+    // the frame is still committed exactly as upstream does, so a recurrence
+    // shows up in the usage log instead of only as ghosting. waitBusy() is what
+    // waitRefreshComplete() runs for the UC8179's UcIdleHigh BUSY_N, and it
+    // returns whether BUSY was seen asserted. One count per activation, as in
+    // activationLanded().
+    bool powered = true;
+    if (!_isScreenOn) { bus.cmd(CMD_POWER_ON); powered = bus.waitBusy("8179 text power"); _isScreenOn = true; }
     bus.cmd(CMD_DISPLAY_REFRESH);
-    bus.waitRefreshComplete("UC8179 one-pass text AA");
+    const bool started = bus.waitBusy("UC8179 one-pass text AA");
+    if (!powered || !started) {
+      noteLostActivation();
+      if (Serial) {
+        Serial.printf("[%lu] [EPD] 8179 ACTIVATION LOST at text AA: PON %s, DRF %s; frame committed (unguarded)\n",
+                      millis(), powered ? "ok" : "unobserved", started ? "ok" : "unobserved");
+      }
+    }
     if (bus.isBusy()) { _textAa.invalidate(); _needFullClear = true; return; }
     _grayRefreshedOnce = true;
     _textAa.finish(20, -1, -1, -22);
