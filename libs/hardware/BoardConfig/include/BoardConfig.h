@@ -412,8 +412,13 @@
 // framebuffer with the CPU, so no transfer DMAs from PSRAM.
 // (The prebuilt Arduino-ESP32 libs disable BSS-in-PSRAM, so this is a runtime
 // heap allocation, not EXT_RAM_BSS_ATTR.)
+// FORK: -DFREEINK_FB_INTERNAL is an explicit request to pin the framebuffer and
+// the async shadow to internal SRAM (FreeInkDisplay::allocFrameBufferStorage), so
+// it outranks the BOARD_HAS_PSRAM default here; without this the PSRAM branch
+// would win and silently void the opt-in. The boards that always need PSRAM keep it.
 #ifndef FREEINK_FB_PSRAM
-#if defined(BOARD_HAS_PSRAM) || FREEINK_DEVICE_M5PAPER || FREEINK_DEVICE_PAPERMONO || FREEINK_DEVICE_PICCO
+#if (defined(BOARD_HAS_PSRAM) && !defined(FREEINK_FB_INTERNAL)) || FREEINK_DEVICE_M5PAPER || FREEINK_DEVICE_PAPERMONO || \
+    FREEINK_DEVICE_PICCO
 #define FREEINK_FB_PSRAM 1
 #else
 #define FREEINK_FB_PSRAM 0
